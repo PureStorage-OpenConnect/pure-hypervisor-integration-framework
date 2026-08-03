@@ -1,0 +1,71 @@
+---
+# Register ESXi hosts and a host group on an Everpure FlashArray for VMware vSphere.
+#
+# Invoked by the vSphere connector's HOST_REGISTER capability via
+# JobRunner.run_ansible(). Uses the official purestorage.flasharray collection.
+#
+# Required collection:
+#   ansible-galaxy collection install purestorage.flasharray
+#
+# Extra vars passed by the connector:
+#   fa_url        FlashArray management endpoint (host/IP or URL)
+#   fa_api_token  FlashArray API token (minted via ctx.array.create_api_token)
+#   host_group    Name of the host group to create
+#   protocol      Transport: iscsi | fc | nvme-fc | nvme-roce
+#   esxi_hosts    List of ESXi host names (one FlashArray host per ESXi node)
+#   iqns          List of iSCSI IQNs (when transport is iSCSI)
+#   wwns          List of FC WWNs (when transport is FC)
+#   nqns          List of NVMe NQNs (when transport is NVMe-oF)
+#
+# The initiator lists (iqns/wwns/nqns) are normally AUTO-DISCOVERED by the
+# connector from vCenter (ESXi storage adapters) and passed in here; the operator
+# only types them to override discovery. See _discover_esxi_initiators() in
+# backend/phif/connectors/vsphere/connector.py.
+#
+# For Fibre Channel (protocol=fc) the connector passes the ESXi HBA port WWNs in
+# `wwns` and leaves iqns/nqns empty; hosts are created on the array by WWN. The
+# WWNs must already be zoned to the array on the SAN fabric (a prerequisite that
+# happens switch-side, outside this playbook).
+#
+# NOTE(doc-validate): when each ESXi host has its own initiators, prefer passing
+# per-host initiator lists and looping create per host. This baseline creates one
+# host per esxi_hosts entry plus the shared host group.
+- name: Register vSphere ESXi hosts on FlashArray
+  hosts: localhost
+  gather_facts: false
+  vars:
+    fa_url: ""
+    fa_api_token: ""
+    host_group: "vsphere-cluster"
+    protocol: "iscsi"
+    esxi_hosts: []
+    iqns: []
+    wwns: []
+    nqns: []
+  collections:
+    - purestorage.flasharray
+  # Map the connector's transport to the purefa_host `protocol` value. FC and the
+  # NVMe-oF variants register by WWN/NQN respectively; iSCSI registers by IQN.
+  tasks:
+    - name: Create FlashArray hosts for each ESXi node
+      purestorage.flasharray.purefa_host:
+        name: "{{ item }}"
+        protocol: >-
+          {{ 'fc' if protocol == 'fc'
+             else ('nvme' if protocol in ['nvme-fc', 'nvme-roce', 'nvme-tcp']
+             else 'iscsi') }}
+        iqn: "{{ iqns if iqns | length > 0 else omit }}"
+        wwns: "{{ wwns if wwns | length > 0 else omit }}"
+        nqn: "{{ nqns if nqns | length > 0 else omit }}"
+        state: present
+        fa_url: "{{ fa_url }}"
+        api_token: "{{ fa_api_token }}"
+      loop: "{{ esxi_hosts if esxi_hosts | length > 0 else [host_group] }}"
+
+    - name: Create the host group for the vSphere cluster
+      purestorage.flasharray.purefa_hostgroup:
+        name: "{{ host_group }}"
+        host: "{{ esxi_hosts if esxi_hosts | length > 0 else [host_group] }}"
+        state: present
+        fa_url: "{{ fa_url }}"
+        api_token: "{{ fa_api_token }}"

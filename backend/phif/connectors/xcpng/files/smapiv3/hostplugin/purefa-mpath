@@ -1,0 +1,58 @@
+#!/usr/bin/env python
+"""XAPI host plugin: pool-wide multipath maintenance for the PureFA SR.
+
+Invoked from the volume plugin (which runs only on the SR master) via
+``xe host-call-plugin`` so EVERY pool host can act on a volume -- the master
+can't otherwise reach the other dom0s.
+
+Functions:
+  * flush  (args: wwid)  -- remove the dm-multipath map for <wwid> and delete its
+                            now-idle SCSI path devices. Called on VDI delete so a
+                            destroyed volume leaves no STALE map on any host (a
+                            leftover map wedges multipathd and blocks new LUNs).
+  * rescan (args: -)     -- iscsiadm session rescan + assemble, so a newly created
+                            volume appears on this host.
+
+Lives at /etc/xapi.d/plugins/purefa-mpath (mode +x).
+"""
+
+import subprocess
+
+import XenAPIPlugin
+
+
+def _sh(cmd):
+    return subprocess.call(cmd, shell=True)
+
+
+def _remove_scsi_paths(wwid):
+    # Delete the underlying sd* path devices for this WWID so they don't ghost.
+    script = (
+        'for b in /sys/block/sd*; do '
+        '  n=$(basename "$b"); '
+        '  w=$(/lib/udev/scsi_id -g -u -d /dev/$n 2>/dev/null); '
+        '  if [ "$w" = "%s" ]; then echo 1 > "$b/device/delete" 2>/dev/null; fi; '
+        'done' % wwid
+    )
+    _sh(script)
+
+
+def flush(session, args):
+    wwid = (args or {}).get("wwid", "").strip()
+    if not wwid:
+        return "no-wwid"
+    _sh("multipath -f %s >/dev/null 2>&1 || true" % wwid)
+    _remove_scsi_paths(wwid)
+    _sh("multipath -f %s >/dev/null 2>&1 || true" % wwid)  # after paths removed
+    return "flushed %s" % wwid
+
+
+def rescan(session, args):
+    _sh("iscsiadm -m session --rescan >/dev/null 2>&1 || true")
+    _sh("nvme connect-all >/dev/null 2>&1 || true")
+    _sh("multipath >/dev/null 2>&1 || true")
+    return "rescanned"
+
+
+if __name__ == "__main__":
+    XenAPIPlugin.dispatch({"flush": flush, "rescan": rescan})

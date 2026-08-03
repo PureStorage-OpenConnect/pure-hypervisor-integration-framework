@@ -1,0 +1,104 @@
+:root {
+  --bg: #0e1116;
+  --panel: #171b22;
+  --panel-2: #1f242d;
+  --border: #2a313c;
+  --text: #e6edf3;
+  --muted: #8b949e;
+  --accent: #f96e0a; /* Everpure orange */
+  --green: #3fb950;
+  --red: #f85149;
+  --yellow: #d29922;
+}
+
+* { box-sizing: border-box; }
+body {
+  margin: 0;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  background: var(--bg);
+  color: var(--text);
+}
+
+.layout { display: flex; min-height: 100vh; }
+.sidebar {
+  width: 220px;
+  background: var(--panel);
+  border-right: 1px solid var(--border);
+  padding: 20px 12px;
+  display: flex;
+  flex-direction: column;
+}
+/* Standing reminder that PHIF is unsupported and destructive — see DISCLAIMER.md. */
+.unsupported-note {
+  margin-top: auto;
+  padding: 10px;
+  border: 1px solid var(--yellow);
+  border-radius: 6px;
+  background: rgba(210, 153, 34, 0.1);
+  color: var(--muted);
+  font-size: 10.5px;
+  line-height: 1.45;
+}
+.unsupported-note strong { display: block; color: var(--yellow); margin-bottom: 3px; }
+.brand { font-weight: 700; font-size: 22px; color: var(--accent); margin-bottom: 24px; padding: 0 8px; }
+.brand-sub { display: block; font-size: 11px; color: var(--muted); font-weight: 400; }
+.nav-item {
+  display: block; padding: 9px 12px; border-radius: 6px; color: var(--text);
+  text-decoration: none; margin-bottom: 4px; font-size: 14px;
+}
+.nav-item:hover { background: var(--panel-2); }
+.nav-item.active { background: var(--accent); color: #1a1a1a; font-weight: 600; }
+
+.content { flex: 1; padding: 28px 36px; max-width: 1100px; }
+h1 { font-size: 24px; margin: 0 0 4px; }
+h2 { font-size: 17px; margin: 24px 0 12px; }
+.subtitle { color: var(--muted); margin: 0 0 24px; }
+
+.card { background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 18px; margin-bottom: 16px; }
+table { width: 100%; border-collapse: collapse; }
+th, td { text-align: left; padding: 10px 12px; border-bottom: 1px solid var(--border); font-size: 14px; }
+th { color: var(--muted); font-weight: 600; font-size: 12px; text-transform: uppercase; }
+
+label { display: block; font-size: 13px; color: var(--muted); margin: 10px 0 4px; }
+input, select, textarea {
+  width: 100%; padding: 9px 11px; background: var(--panel-2); border: 1px solid var(--border);
+  border-radius: 6px; color: var(--text); font-size: 14px; font-family: inherit;
+}
+textarea { min-height: 90px; resize: vertical; }
+.row { display: flex; gap: 14px; }
+.row > * { flex: 1; }
+
+button {
+  background: var(--accent); color: #1a1a1a; border: none; padding: 9px 16px; border-radius: 6px;
+  font-weight: 600; cursor: pointer; font-size: 14px;
+}
+button:hover { filter: brightness(1.1); }
+button.secondary { background: var(--panel-2); color: var(--text); border: 1px solid var(--border); }
+button.danger { background: var(--red); color: #fff; }
+button:disabled { opacity: 0.5; cursor: not-allowed; }
+
+.badge { display: inline-block; padding: 2px 9px; border-radius: 20px; font-size: 12px; font-weight: 600; }
+.badge.ga { background: rgba(63,185,80,0.15); color: var(--green); }
+.badge.preview { background: rgba(210,153,34,0.15); color: var(--yellow); }
+.badge.scaffold { background: rgba(139,148,158,0.15); color: var(--muted); }
+.cap { display: inline-block; background: var(--panel-2); border: 1px solid var(--border); padding: 2px 8px; border-radius: 4px; font-size: 11px; margin: 0 4px 4px 0; }
+
+.status-succeeded, .status-deployed { color: var(--green); }
+.status-failed, .status-error { color: var(--red); }
+.status-running, .status-pending { color: var(--yellow); }
+.status-not_deployed { color: var(--muted); }
+
+.logs {
+  background: #0a0c10; border: 1px solid var(--border); border-radius: 8px; padding: 14px;
+  font-family: "SF Mono", Menlo, Consolas, monospace; font-size: 12.5px; line-height: 1.6;
+  white-space: pre-wrap; max-height: 420px; overflow-y: auto; color: #c9d1d9;
+}
+.error { color: var(--red); font-size: 13px; margin-top: 8px; }
+.success { color: var(--green); font-size: 13px; margin-top: 8px; }
+@keyframes progress-slide {
+  0%   { margin-left: -40%; }
+  100% { margin-left: 100%; }
+}
+.muted { color: var(--muted); }
+.toolbar { display: flex; justify-content: space-between; align-items: center; gap: 12px; }
+.token-box { font-family: monospace; background: var(--panel-2); padding: 10px; border-radius: 6px; word-break: break-all; border: 1px solid var(--accent); }

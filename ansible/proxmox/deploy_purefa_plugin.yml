@@ -1,0 +1,89 @@
+---
+# Deploy the Everpure FlashArray 'purefa' storage plugin to Proxmox VE node(s).
+#
+# This mirrors the PHIF Proxmox connector's DEPLOY_PLUGIN action so the same
+# work can be driven via Ansible (ctx.runner.run_ansible) instead of raw SSH.
+#
+# Model: each VM disk is its own FlashArray volume presented directly to the VM
+# as a raw multipath block device (NVMe-TCP / iSCSI / FC). No LVM layer.
+# Snapshots and clones are performed on the array by the plugin.
+#
+# Example:
+#   ansible-playbook deploy_purefa_plugin.yml \
+#     -e storage_id=purefa \
+#     -e pure_endpoint=https://fa.example.com \
+#     -e pure_api_token=XXXX \
+#     -e protocol=nvme-tcp \
+#     -e host_group=pve-cluster
+#
+# TODO(doc-validate): pin the perl REST dependency package names and the exact
+# PVE daemon set against your Proxmox VE release.
+
+- name: Deploy Everpure FlashArray purefa storage plugin
+  hosts: proxmox
+  become: true
+  gather_facts: false
+
+  vars:
+    storage_id: purefa
+    protocol: nvme-tcp           # iscsi | fc | nvme-tcp
+    host_group: pve-cluster
+    content: "images,rootdir"
+    plugin_dest: /usr/share/perl5/PVE/Storage/Custom/PureFAPlugin.pm
+    # pure_endpoint / pure_api_token must be supplied via -e or inventory vars.
+
+  tasks:
+    - name: Install perl REST + multipath dependencies
+      # sg3-utils provides rescan-scsi-bus.sh used by the FC (and iSCSI) rescan
+      # path. For protocol=fc there is NO host-side login: SAN zoning on the
+      # fabric switch (node HBA WWPNs <-> array FC target ports) plus host
+      # registration by WWN on the array is the prerequisite; the node only
+      # rescans the SCSI bus and maps the volume by multipath WWID.
+      ansible.builtin.apt:
+        name:
+          - libjson-perl
+          - liblwp-protocol-https-perl
+          - libwww-perl
+          - multipath-tools
+          - sg3-utils
+        update_cache: true
+        state: present
+
+    - name: Ensure PVE custom storage plugin directory exists
+      ansible.builtin.file:
+        path: "{{ plugin_dest | dirname }}"
+        state: directory
+        mode: "0755"
+
+    - name: Install PureFAPlugin.pm (storage type 'purefa')
+      ansible.builtin.copy:
+        src: files/PureFAPlugin.pm
+        dest: "{{ plugin_dest }}"
+        mode: "0644"
+      notify: reload pve daemons
+
+    - name: Define the purefa storage in /etc/pve/storage.cfg
+      # storage.cfg is cluster-wide (pmxcfs); run once from a single node.
+      run_once: true
+      ansible.builtin.blockinfile:
+        path: /etc/pve/storage.cfg
+        marker: "# {mark} PHIF purefa {{ storage_id }}"
+        block: |
+          purefa: {{ storage_id }}
+          	pure_endpoint {{ pure_endpoint }}
+          	pure_api_token {{ pure_api_token }}
+          	protocol {{ protocol }}
+          	host_group {{ host_group }}
+          	content {{ content }}
+          	shared 1
+      notify: reload pve daemons
+
+  handlers:
+    - name: reload pve daemons
+      ansible.builtin.systemd:
+        name: "{{ item }}"
+        state: reloaded
+      loop:
+        - pvedaemon
+        - pveproxy
+        - pvestatd

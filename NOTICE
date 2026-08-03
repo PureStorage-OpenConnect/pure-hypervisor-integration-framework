@@ -1,0 +1,51 @@
+PHIF — Universal Hypervisor Integration Framework
+Copyright 2026 Everpure Data, Inc.
+
+Licensed under the Apache License, Version 2.0 (the "License"); you may not
+use this software except in compliance with the License. A copy of the
+License is provided in the LICENSE file in this repository and is also
+available at http://www.apache.org/licenses/LICENSE-2.0
+
+---------------------------------------------------------------------------
+NOT A SUPPORTED PRODUCT
+
+PHIF is an independent, experimental project. It is NOT a supported product,
+is NOT covered by any Everpure Data support agreement, warranty, SLA, or
+maintenance contract, and support cases will not be accepted for it.
+
+Use of PHIF is entirely AT YOUR OWN RISK. See DISCLAIMER.md for the full
+statement.
+
+---------------------------------------------------------------------------
+Third-party components
+
+PHIF automates the deployment of existing, separately-licensed hypervisor
+storage integrations and depends on third-party open-source software, each
+distributed under its own license. Notable runtime dependencies include:
+
+  * FastAPI, Starlette, Uvicorn, Pydantic            (MIT / BSD)
+  * SQLAlchemy, Alembic, psycopg                     (MIT / LGPL)
+  * cryptography                                     (Apache-2.0 / BSD)
+  * httpx, asyncssh, ansible-runner                  (BSD / Apache-2.0)
+  * py-pure-client                                   (BSD-2-Clause)
+  * pyvmomi                                          (Apache-2.0)
+  * React, Vite, and the frontend toolchain          (MIT)
+
+The HPE VM Essentials connector builds a Morpheus/VME storage plugin against
+the morpheus-plugin-api, which is provided by the appliance at runtime and is
+not redistributed by this project.
+
+---------------------------------------------------------------------------
+Trademarks
+
+All trademarks are the property of their respective owners and are used here
+for identification purposes only. Their use does not imply any affiliation
+with, sponsorship by, or endorsement from the trademark holders.
+
+Everpure Data, FlashArray, Purity, and Portworx are trademarks of Everpure
+Data, Inc. VMware and vSphere are trademarks of Broadcom Inc. Red Hat and
+OpenShift are trademarks of Red Hat, Inc. OpenStack is a trademark of the
+OpenInfra Foundation. Proxmox is a trademark of Proxmox Server Solutions
+GmbH. XCP-ng is a trademark of Vates SAS. HPE and HPE VM Essentials are
+trademarks of Hewlett Packard Enterprise. Morpheus is a trademark of
+Morpheus Data, LLC.

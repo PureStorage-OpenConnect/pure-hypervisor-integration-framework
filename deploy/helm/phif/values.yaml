@@ -1,0 +1,41 @@
+image:
+  backend: everpure/phif-backend:0.1.0
+  frontend: everpure/phif-frontend:0.1.0
+  pullPolicy: IfNotPresent
+
+# Vault master key (Fernet) — encrypts every stored array token and hypervisor
+# credential. Generate one with:
+#   python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
+#
+# Leave empty and the chart generates a key on first install, then reuses it on
+# every subsequent upgrade (it reads the existing Secret back out of the cluster).
+#
+# Supplying your own is still recommended: it is the only copy you control. A
+# generated key lives solely in the Secret, so `helm uninstall` destroys it and
+# every stored token becomes permanently unrecoverable. If you set it here, keep
+# this file out of version control.
+vaultMasterKey: ""
+
+mockMode: false
+
+database:
+  # Use the bundled Postgres subchart-style deployment, or point at an external DB.
+  internal: true
+  url: ""  # required when internal=false, e.g. postgresql+psycopg://user:pass@host:5432/phif
+
+backend:
+  replicas: 1
+  resources: {}
+
+frontend:
+  replicas: 1
+
+ingress:
+  enabled: false
+  className: ""
+  host: phif.example.com
+  tls: false
+
+postgres:
+  image: postgres:16-alpine
+  storage: 5Gi

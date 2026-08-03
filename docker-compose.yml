@@ -1,0 +1,135 @@
+# PHIF — full stack: Postgres + backend API + frontend (nginx), TLS-terminated.
+#
+# Set a real vault key before first run:
+#   export PHIF_VAULT_MASTER_KEY=$(python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())")
+# For a no-hardware demo, set PHIF_MOCK_MODE=1 to stub all array/hypervisor I/O.
+#
+# TLS: place a cert/key at ./certs/tls.crt and ./certs/tls.key before starting
+# (see deploy/gen-certs.sh). Both the API (uvicorn) and the UI (nginx) serve HTTPS.
+# UI:  https://<host>        (also :8443)   — HTTP :80 redirects to HTTPS
+# API: https://<host>:8000
+
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: phif
+      POSTGRES_PASSWORD: phif
+      POSTGRES_DB: phif
+    volumes:
+      - phif-db:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U phif"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  backend:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    environment:
+      PHIF_DATABASE_URL: postgresql+psycopg://phif:phif@db:5432/phif
+      PHIF_VAULT_MASTER_KEY: ${PHIF_VAULT_MASTER_KEY:-}
+      PHIF_MOCK_MODE: ${PHIF_MOCK_MODE:-0}
+      PHIF_CORS_ORIGINS: ${PHIF_CORS_ORIGINS:-["https://localhost","https://localhost:8443"]}
+    # Serve the API over TLS using the mounted self-signed cert.
+    command:
+      - uvicorn
+      - phif.main:app
+      - --host
+      - "0.0.0.0"
+      - --port
+      - "8000"
+      - --ssl-keyfile
+      - /certs/tls.key
+      - --ssl-certfile
+      - /certs/tls.crt
+    volumes:
+      - ./certs:/certs          # rw: backend writes vsphere-plugin-secret
+      - /var/run/docker.sock:/var/run/docker.sock
+    depends_on:
+      db:
+        condition: service_healthy
+    ports:
+      - "8000:8000"
+
+  frontend:
+    build: ./frontend
+    volumes:
+      - ./certs:/etc/nginx/certs:ro
+    depends_on:
+      - backend
+    ports:
+      - "443:443"     # standard HTTPS
+      - "8443:443"    # alternate HTTPS (fallback if 443 is firewalled)
+      - "80:80"       # redirects to HTTPS
+
+# ── Everpure vSphere Client Plugin ──────────────────────────────────────────────
+# Both images are published on Docker Hub, so compose pulls them for you — there
+# is no image to build or load by hand.
+#
+# One-time secret generation:
+#   openssl rand -base64 128 | tr -d '\n' > certs/vsphere-plugin-secret
+# Then:
+#   docker compose --profile vsphere up -d
+#
+# The plugin management UI is at https://<host>:9443
+# Register it with vCenter from the PHIF "Deploy vSphere plugin" action.
+#
+# You can also skip this profile entirely and install the plugin from the PHIF
+# UI (vSphere Plugin page → "Install from Docker Hub"), which pulls the same
+# images and generates the secret for you.
+  vsphere-plugin-server:
+    image: everpure/client-plugin-vsphere:5.6.1
+    profiles: [vsphere]
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    tmpfs:
+      - /tmp
+    environment:
+      - CERTIFICATE_PATH=/run/secrets/vsphere_cert
+      - SECRET_KEY_PATH=/run/secrets/vsphere_secret_key
+    volumes:
+      - vsphere-plugin-storage:/storage
+    secrets:
+      - vsphere_cert
+      - vsphere_secret_key
+    restart: unless-stopped
+
+  vsphere-plugin-proxy:
+    image: everpure/client-plugin-vsphere-reverse-proxy:5.6.1
+    profiles: [vsphere]
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    tmpfs:
+      - /tmp
+      - /tmpconf:mode=1777,size=24k
+    environment:
+      - CERTIFICATE_PATH=/run/secrets/vsphere_cert
+      - CERTIFICATE_KEY_PATH=/run/secrets/vsphere_key
+      - VSPHERE_PLUGIN_SERVICE=vsphere-plugin-server:8080
+      - NGINX_ENVSUBST_OUTPUT_DIR=/tmpconf
+    depends_on:
+      - vsphere-plugin-server
+    ports:
+      - "9443:8084"   # vSphere plugin HTTPS (PHIF frontend owns 443)
+      - "9081:8080"   # optional healthcheck
+    secrets:
+      - vsphere_cert
+      - vsphere_key
+    restart: unless-stopped
+
+secrets:
+  vsphere_cert:
+    file: ./certs/tls.crt
+  vsphere_key:
+    file: ./certs/tls.key
+  vsphere_secret_key:
+    file: ./certs/vsphere-plugin-secret
+
+volumes:
+  phif-db:
+  vsphere-plugin-storage:

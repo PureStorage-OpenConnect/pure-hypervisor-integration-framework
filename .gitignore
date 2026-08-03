@@ -1,0 +1,57 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+
+# Node
+node_modules/
+dist/
+.vite/
+
+# Env / secrets — never commit these
+.env
+.env.*
+!.env.example
+*.local
+certs/
+*.key
+*.crt
+*.pem
+*.p12
+*.pfx
+
+# Local environment-specific deploy scripts (contain lab hostnames/users)
+/deploy-vm.sh
+/deploy-vm.ps1
+
+# Local lab / scratch artifacts — not part of the published project
+/TODO.md
+/diag_*.py
+/scratch/
+/notes/
+*.internal.md
+*vSphere Client Plugin Container.md
+
+# Plugin container image tars. The images are published on Docker Hub, so these
+# are only ever local scratch copies for air-gapped installs — never committed.
+vsphere-plugin*.tar
+*.jar
+
+# Job workspace
+/tmp/phif-jobs/
+
+# Editor / agent local state
+.claude/
+.idea/
+.vscode/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Blog drafts (authored for the blog platform, not part of the shipped project)
+/blog/

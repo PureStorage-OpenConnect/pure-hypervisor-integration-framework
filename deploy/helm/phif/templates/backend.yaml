@@ -1,0 +1,49 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ .Release.Name }}-backend
+  labels:
+    app: {{ .Release.Name }}-backend
+spec:
+  replicas: {{ .Values.backend.replicas }}
+  selector:
+    matchLabels:
+      app: {{ .Release.Name }}-backend
+  template:
+    metadata:
+      labels:
+        app: {{ .Release.Name }}-backend
+    spec:
+      containers:
+        - name: backend
+          image: {{ .Values.image.backend }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          ports:
+            - containerPort: 8000
+          env:
+            - name: PHIF_DATABASE_URL
+              value: {{ include "phif.dbUrl" . | quote }}
+            - name: PHIF_MOCK_MODE
+              value: {{ .Values.mockMode | quote }}
+            - name: PHIF_VAULT_MASTER_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Release.Name }}-vault
+                  key: vault-master-key
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: 8000
+            initialDelaySeconds: 5
+          resources: {{ toYaml .Values.backend.resources | nindent 12 }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ .Release.Name }}-backend
+spec:
+  selector:
+    app: {{ .Release.Name }}-backend
+  ports:
+    - port: 8000
+      targetPort: 8000

@@ -1,0 +1,6 @@
+apiVersion: v2
+name: phif
+description: Everpure Data Universal Hypervisor Integration Framework
+type: application
+version: 0.1.0
+appVersion: "0.1.0"

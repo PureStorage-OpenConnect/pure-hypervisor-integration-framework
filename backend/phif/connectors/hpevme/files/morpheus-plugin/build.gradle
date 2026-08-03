@@ -1,0 +1,91 @@
+// Everpure FlashArray storage provider plugin for HPE VM Essentials (VME) /
+// Morpheus. Builds a shadow ("fat") JAR uploaded via the VME Manager UI at
+// Administration -> Integrations -> Plugins (loads with no restart).
+//
+//   ./gradlew shadowJar   ->  build/libs/pure-flasharray-vme-plugin-<ver>-all.jar
+//
+// morpheus-plugin-api and Groovy are provided by the appliance at runtime
+// (compileOnly), so the shadow JAR only carries this plugin's own classes.
+//
+// The provider icon (src/assets/images/pure.svg) is compiled into the JAR at
+// assets/pure.svg and registered by the asset-pipeline + morpheus-plugin-gradle
+// build plugins; the appliance then serves it at
+// /assets/plugin/<plugin-name-slug>/pure.svg. A bare resources file is NOT
+// enough -- the asset pipeline manifest is what makes the appliance resolve it.
+
+buildscript {
+    repositories {
+        mavenLocal()
+        mavenCentral()
+        maven { url "https://plugins.gradle.org/m2/" }
+        maven { url "https://nexus.bertramlabs.com/content/repositories/releases" }
+        maven { url "https://nexus.bertramlabs.com/content/repositories/publicReleases" }
+        maven { url "https://nexus.bertramlabs.com/content/repositories/snapshots" }
+    }
+    dependencies {
+        classpath "com.github.johnrengelman:shadow:8.1.1"
+        classpath "com.morpheusdata:morpheus-plugin-gradle:${morpheusGradleVersion}"
+        classpath "com.bertramlabs.plugins:asset-pipeline-gradle:${assetPipelineVersion}"
+    }
+}
+
+apply plugin: 'java'
+apply plugin: 'groovy'
+apply plugin: 'com.github.johnrengelman.shadow'
+apply plugin: 'asset-pipeline'
+apply plugin: 'com.morpheusdata.morpheus-plugin-gradle'
+
+group = 'com.morpheusdata.pure'
+// Bump on every plugin change: VME registers providers (datastore type +
+// provision-type binding, storage server type, icon) at load time keyed by
+// version, so re-uploading the SAME version does NOT re-register the changes.
+version = '0.1.37'
+
+// morpheus-plugin-api 1.2.x is published as a Java 11 artifact, so the plugin
+// must target Java 11 (Gradle rejects it under an 1.8 toolchain). The build image
+// uses JDK 11.
+sourceCompatibility = '11'
+targetCompatibility = '11'
+
+repositories {
+    mavenCentral()
+    maven { url "https://nexus.bertramlabs.com/content/repositories/releases" }
+    maven { url "https://nexus.bertramlabs.com/content/repositories/publicReleases" }
+}
+
+dependencies {
+    // Provided by the Morpheus/VME appliance at runtime.
+    compileOnly "com.morpheusdata:morpheus-plugin-api:${morpheusApiVersion}"
+    compileOnly "org.codehaus.groovy:groovy-all:${groovyVersion}"
+    compileOnly "org.slf4j:slf4j-api:${slf4jVersion}"
+    // DatastoreTypeProvider.cloneVolume(...) references CloudFileInterface from
+    // Karman (a morpheus-plugin-api dependency that isn't exposed transitively for
+    // compileOnly); needed only at compile time. Version per morpheus-plugin-core.
+    compileOnly "com.bertramlabs.plugins:karman-core:${karmanVersion}"
+}
+
+assets {
+    packagePlugin = false   // required: false for plugins (per the official samples)
+}
+
+jar {
+    // The Morpheus PluginManager reads these manifest attributes to load the plugin.
+    // Morpheus-Logo points at the compiled asset path inside the JAR (assets/...).
+    manifest {
+        attributes(
+            'Plugin-Class': 'com.morpheusdata.pure.PureStoragePlugin',
+            'Plugin-Version': version,
+            'Morpheus-Logo': 'assets/pure.svg',
+            'Morpheus-Logo-Dark': 'assets/pure.svg'
+        )
+    }
+}
+
+shadowJar {
+    // Keep the appliance-provided libs out of the plugin JAR.
+    // (No third-party runtime deps: the FlashArray client uses java.net + groovy.json.)
+    archiveClassifier.set('all')
+}
+
+tasks.assemble.dependsOn tasks.shadowJar
+build.dependsOn shadowJar
