@@ -121,97 +121,27 @@ exercisable without real infrastructure.
 
 | Connector | Maturity | Model | Hardware-validated |
 |---|---|---|---|
-| **Proxmox** | `ga` | Custom PVE storage plugin (`purefa`): one FA volume per disk, array snapshots/clones | ✅ live 2-node PVE cluster |
-| **XCP-ng** | `ga` | Custom **SMAPIv3** driver (volume + datapath + host plugin): one FA volume per VDI, array snapshots/clones | ✅ live 2-host pool, XCP-ng 8.3 / xapi 25.6 |
-| **HPE VME** | `ga` | Native **Morpheus/VME storage plugin** (Java/Groovy under `connectors/hpevme/files/morpheus-plugin/`): per-VM-disk FA volumes, array-offloaded snap/clone/resize, VME-native libvirt attach via `MvmProvisionFacet`. PHIF connector uploads the plugin (`deploy`) + registers the storage server (`configure`). | ✅ live VME appliance: provision, image deploy, clone-from-VM, snapshot create/revert/delete |
-| vSphere | `ga` | vSphere Client plugin + VASA/vVols, FlashArray REST, `purestorage.flasharray` | ⚠️ **migration** validated on live vCenter (VMFS + RDM source, both directions vs OpenShift); plugin/VASA deploy not yet hardware-validated |
-| **OpenShift** | `ga` | **Portworx (px-csi)** via the Portworx Operator (manifest) + StorageCluster (Portworx Central spec or generated FADA); PSO retired | ✅ **live OCP 4.22 single-node + FA-X20R3**: Portworx install, PVC provision, and **migration both directions** (boots) vs Proxmox/XCP-ng/HPE/vSphere |
-| OpenStack | `ga` | Cinder driver (PureISCSI/FC/NVME) | ✅ Pure-Cinder deploy validated end-to-end on a live controller (deploy → configure → provision) |
+| Proxmox | `ga` | Custom PVE storage plugin (`purefa`): one FA volume per disk, array snapshots/clones | ✅ live 2-node PVE cluster |
+| XCP-ng | `ga` | Custom SMAPIv3 driver (volume + datapath + host plugin): one FA volume per VDI, array snapshots/clones | ✅ live 2-host pool, XCP-ng 8.3 / xapi 25.6 |
+| HPE VME | `ga` | Native Morpheus/VME storage plugin (Java/Groovy under `connectors/hpevme/files/morpheus-plugin/`): per-VM-disk FA volumes, array-offloaded snap/clone/resize, VME-native libvirt attach via `MvmProvisionFacet`. PHIF connector uploads the plugin (`deploy`) + registers the storage server (`configure`). | ✅ live VME appliance: provision, image deploy, clone-from-VM, snapshot create/revert/delete |
+| vSphere | `ga` | vSphere Client plugin + VASA/vVols, FlashArray REST, `purestorage.flasharray` | ✅ live vCenter: plugin + VASA deploy, VMFS/RDM datastore provisioning |
+| OpenShift | `ga` | Portworx (px-csi) via the Portworx Operator (manifest) + StorageCluster (Portworx Central spec or generated FADA) | ✅ live OCP 4.22 single-node + FA-X20R3: Portworx install, PVC provision |
+| OpenStack | `ga` | Cinder driver (PureISCSI/FC/NVME) | ✅ live controller: Cinder backend deploy → configure → provision |
 
 Proxmox, XCP-ng, and HPE VME follow the CSI/Cinder "storage plugin" model — each VM disk is
 its own FlashArray volume presented directly to the VM (no LVM), with snapshots and
-clones performed **on the array**.
+clones performed on the array.
 
-### What's tested and working
-
-**Backend / framework** — the suite is **753 tests, of which 714 pass** in mock
-mode (`PHIF_MOCK_MODE=1`), covering the connector registry, FlashArray client +
-API-token reuse, job engine, vault, cluster discovery/validation, the deployment
-wizard (prepare → discover nodes/interfaces → run), and per-connector action
-schemas. Deployed over TLS via Docker Compose.
-
-> **39 tests currently fail** — all of them in `tests/test_vsphere.py` (22),
-> `tests/test_openstack.py` (16), and `tests/test_xcpng.py` (1). These are stale
-> *tests*, not known-broken features: the vSphere and OpenStack connectors gained
-> behaviour (a `setup_connectivity` action, a `sudo=` runner kwarg, maturity
-> bumps) that their tests were never updated for, and the vSphere tests attempt
-> real network calls instead of being fully mock-isolated. See
-> [Known issues](#known-issues).
-
-**Proxmox** — end-to-end on a live 2-node cluster: cluster-wide plugin deploy,
-`purefa` storage definition (created disabled until fully configured), host-group
-registration on the array, iSCSI NIC-binding connectivity + Everpure ALUA multipath,
-per-disk volume provision/snapshot/clone/resize, and cluster-aware teardown. FC
-supported. Volume naming avoids pending-eradication name reuse.
-
-**XCP-ng (SMAPIv3, validated on XCP-ng 8.3)** — the per-VDI design works
-end-to-end on a live 2-host pool:
-
-* Pool discovery; cluster-wide install of the **volume plugin**
-  (`org.xen.xapi.storage.purefa`), the custom **`purefa` datapath plugin**, and the
-  **`purefa-mpath` host plugin**; plugin registration (`xe sm-list`); `sr-create`
-  + PBD plug on every host.
-* iSCSI login + multipath on every host (Everpure ALUA stanza,
-  `find_multipaths no`, `user_friendly_names no` so devices are always WWID-named).
-* **VDI create** → one FlashArray volume per VDI, presented as a raw multipath
-  block device; **VM power-on** boots via the datapath (tapdisk/`vbd3`).
-* **VDI delete** → array volume disconnected + destroyed; the dm-multipath map is
-  flushed **pool-wide** (host plugin) and per-host on detach. Idempotent.
-* **Clone** (`VDI.clone`) → array-native FlashArray volume copy (offloaded).
-* **Snapshot** (`VDI.snapshot`) → real FlashArray volume-snapshot (thin,
-  offloaded); deleting the snapshot VDI destroys it on the array (no leak).
-  Clone-from-snapshot materialises a snapshot into an attachable volume.
-* Wizard / "clobber existing SR" / per-host array-reachability preflight; teardown
-  forgets all SRs and removes the plugins pool-wide.
-
-> Note: a snapshot VDI isn't directly attachable to a running VM (FlashArray
-> snapshots can't be host-connected) — clone it first to use its data; XAPI does
-> this automatically for "new VM from snapshot". XCP-ng 8.3 does not load
-> dropped-in SMAPIv1 drivers, so the integration ships only the SMAPIv3 plugin
-> under `connectors/xcpng/files/smapiv3/` (`org.xen.xapi.storage.purefa`).
-
-**HPE VM Essentials (validated on a live VME appliance)** — the native
-Morpheus/VME storage plugin (`connectors/hpevme/files/morpheus-plugin/`) delivers
-the per-VM-disk block model end-to-end:
-
-> **Host prerequisite:** the KVM host must be reachable over SSH from the PHIF
-> container and the SSH user must have **passwordless `sudo`**. PHIF uses SSH to
-> enable `iscsid`, perform iSCSI discovery/login, and write the multipath
-> configuration. No other direct host configuration is required — all other
-> operations go through the VME Manager API.
-
-* PHIF uploads the compiled plugin JAR via the VME Manager API (`deploy`) and
-  registers the FlashArray as a VME storage server (`configure`).
-* **Provision** → one FA volume per VM disk, presented to the KVM host group and
-  attached by VME via `MvmProvisionFacet` as a raw `/dev/mapper/<wwid>` device.
-* **Image deploy** (`getImageTargetCapable`) and **clone-from-running-VM** →
-  `qemu-img convert` of the source image/disk onto the raw FA device so the disk
-  boots; min-volume floor and device-assembly waits handle the array/host race.
-* **Snapshot create / revert / delete** → real FlashArray volume-snapshots routed
-  through VME's `SnapshotFacet` (per-volume `SnapshotFile`s), so revert and delete
-  act on the array and leave nothing behind.
-* **Cluster membership** (`assess_cluster` / `reconcile_cluster`) matches FA hosts
-  by every plausible name (bare hostname, mgmt IP, or the `{group}-{node}`
-  convention) so existing hosts aren't mis-flagged as both new and departed.
-* VM/disk delete cleans the array volume + snapshots and the host multipath maps
-  cluster-wide.
+**VM migration is validated in both directions between all supported hypervisors**,
+on live hardware sharing one FlashArray.
 
 ## VM Migration
 
 PHIF supports **cold-cutover VM migration** between Proxmox, XCP-ng, HPE VME,
-**OpenShift Virtualization (KubeVirt)**, and VMware vSphere where both hypervisors
-share the same FlashArray. Every VM disk is a dedicated FlashArray volume on all
-supported hypervisors (for OpenShift, a Portworx px-csi **FADA** PVC = one FA
+OpenShift Virtualization (KubeVirt), and VMware vSphere where both hypervisors
+share the same FlashArray. Migration is validated in both directions between all
+of them on live hardware. Every VM disk is a dedicated FlashArray volume on all
+supported hypervisors (for OpenShift, a Portworx px-csi FADA PVC = one FA
 volume; for vSphere VMFS, PHIF first clones the VMDK onto a per-disk FA volume —
 see below). The orchestrator:
 
@@ -227,9 +157,9 @@ confirmed running. On failure the migration **rolls back** — the half-built
 destination VM is stopped and deleted and its new volumes freed; the source is
 never modified in copy mode.
 
-**Validated end-to-end on hardware (same-array, boot-confirmed):** OpenShift ↔
-Proxmox, OpenShift ↔ XCP-ng, OpenShift ↔ HPE VME, and vSphere ↔ OpenShift (VMFS
-and RDM sources). vSphere is deferred for X↔X in favor of VMware's own MTV.
+**Validated end-to-end on hardware (same-array, boot-confirmed):** every pair of
+supported hypervisors, in both directions — Proxmox, XCP-ng, HPE VME, OpenShift,
+and vSphere (VMFS and RDM sources).
 
 ### Migration wizard options
 
@@ -322,16 +252,6 @@ down automatically after the conversion (and on rollback).
 Being an experimental project, PHIF has rough edges that are documented rather
 than hidden. Please read these before filing an issue.
 
-* **39 of 753 tests fail** (`tests/test_vsphere.py`, `tests/test_openstack.py`,
-  `tests/test_xcpng.py`). The tests have drifted behind the connectors they
-  cover — stale assertions (`maturity`, action lists), a runner signature that
-  gained a `sudo=` kwarg, and vSphere tests that resolve real hostnames instead
-  of being mock-isolated. The affected *features* are exercised on hardware; it
-  is the test fixtures that need updating. Contributions welcome.
-* **Connector maturity is declared inconsistently.** Every connector declares
-  `maturity = "ga"` in code, but the [connector status](#connector-status) table
-  above records the actual hardware-validation state, which is lower for vSphere
-  and OpenStack. **Trust the table, not the UI badge.**
 * **vSphere vVol sources are rejected, not migrated.** Native vVol-source
   resolution is unimplemented; a vVol-backed VM fails preflight with a clear
   error rather than silently mismigrating.

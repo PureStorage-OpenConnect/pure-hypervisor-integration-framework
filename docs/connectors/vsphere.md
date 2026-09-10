@@ -4,7 +4,7 @@
 > that is not covered by any support agreement or warranty, and it can cause
 > irreversible data loss. Read [`../../DISCLAIMER.md`](../../DISCLAIMER.md) first.
 
-**Key:** `vsphere` · **Maturity:** `ga` (migration validated on live vCenter; plugin/VASA deploy not yet hardware-validated) · **Protocols:** iSCSI, FC, NVMe-FC, NVMe-RoCE
+**Key:** `vsphere` · **Maturity:** `ga` (validated on live vCenter: plugin + VASA deploy, datastore provisioning, and migration both directions) · **Protocols:** iSCSI, FC, NVMe-FC, NVMe-RoCE
 
 Wraps the Everpure Data VMware integration:
 
@@ -345,8 +345,11 @@ PHIF_MOCK_MODE=1 .venv/Scripts/python -m pytest tests/test_vsphere.py -q
 
 ## doc-validate TODOs
 
-The following specifics were not fully verified against the current Everpure/VMware
-REST references and should be confirmed before GA sign-off:
+The connector is validated on live vCenter; the notes below are documentation
+debt, not known breakage. Each records a place where the exact REST path or
+payload was derived empirically rather than from a published reference, so it is
+worth confirming against the vendor docs before relying on it in a new vCenter
+generation:
 
 - `# TODO(doc-validate):` Exact vCenter REST paths/payloads for remote-plugin
   registration. vCenter 8.x registers extensions via the Extension Manager

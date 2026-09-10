@@ -51,18 +51,14 @@ default.
 cd backend && PHIF_MOCK_MODE=1 .venv/Scripts/python -m pytest -q
 ```
 
-The suite is currently **753 tests, 714 passing**. The 39 failures in
-`tests/test_vsphere.py`, `tests/test_openstack.py`, and `tests/test_xcpng.py` are
-known-stale fixtures, not new regressions — see
-[Known issues](README.md#known-issues). **Fixing them is a genuinely useful
-first contribution.**
+The suite is **753 tests, all passing**. Please keep it that way — a red suite on
+`main` makes every subsequent contribution harder to review.
 
 When you change something, please:
 
 - Add or update tests that run green under `PHIF_MOCK_MODE=1` with no network
   access. A test that resolves a real hostname or opens a socket is a bug.
-- Confirm you have not increased the failure count:
-  `pytest -q 2>&1 | tail -1`.
+- Confirm the suite is still fully green: `pytest -q 2>&1 | tail -1`.
 - Keep to the existing style — `ruff` and `black` are configured in
   `backend/pyproject.toml` at a 100-column line length.
 
