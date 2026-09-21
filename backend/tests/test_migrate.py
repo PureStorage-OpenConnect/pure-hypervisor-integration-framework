@@ -4,6 +4,8 @@ spec-capture parsing in mock mode."""
 
 from __future__ import annotations
 
+import re
+
 import pytest
 
 from phif.connectors.base import (
@@ -699,3 +701,209 @@ async def test_list_placements_matches_the_wizard_contract(connector_key, make_c
         for s in p["storage"]:
             assert s.get("id"), f"{connector_key}: storage entry has no id: {s!r}"
             assert s.get("name"), f"{connector_key}: storage entry has no name: {s!r}"
+
+
+# --------------------------------------------------------------------------- #
+# MANAGES_VOLUME_PRESENTATION — platforms that present volumes themselves
+#
+# Nutanix AHV with FlashArray external storage has no operator-managed host
+# group: Prism creates each vDisk's backing volume and connects it to its own
+# stargate hosts. Preflight used to demand a destination host group outright,
+# which failed the migration before it started.
+# --------------------------------------------------------------------------- #
+async def test_dest_without_host_group_fails_when_it_manages_none():
+    """The default is unchanged: a normal destination still needs a host group."""
+    array, src, dst = _build()
+    _make_real([src, dst])
+    dst._hg = ""           # no host group configured
+    assert dst.MANAGES_VOLUME_PRESENTATION is False
+    res = await _svc(src, dst, mode="move").run()
+    assert not res.success
+    assert "host group" in res.message.lower()
+
+
+async def test_dest_managing_its_own_presentation_needs_no_host_group():
+    """With the flag set, preflight proceeds and the migration runs the SAME
+    pattern as any other destination: create dest VM + disks, then copy the
+    source volume on top of them."""
+    array, src, dst = _build()
+    _make_real([src, dst])
+    dst._hg = ""
+    dst.MANAGES_VOLUME_PRESENTATION = True
+    try:
+        res = await _svc(src, dst, mode="move").run()
+        assert res.success, res.message
+        # Destination disks were created per source disk...
+        assert "mkdisk:0" in dst.events and "mkdisk:1" in dst.events
+        # ...and the source data copied onto them WITH OVERWRITE.
+        copies = [kw for op, kw in array.calls if op == "copy_volume"]
+        assert copies and all(kw["overwrite"] for kw in copies)
+        assert {kw["source"] for kw in copies} == {"vol-a", "vol-b"}
+        assert "boot" in dst.events
+    finally:
+        dst.MANAGES_VOLUME_PRESENTATION = False
+
+
+async def test_nutanix_declares_it_manages_volume_presentation():
+    from phif.connectors.nutanix.connector import NutanixConnector
+
+    assert NutanixConnector.MANAGES_VOLUME_PRESENTATION is True
+    # And every other connector keeps the host-group contract.
+    from phif.connectors.registry import get_connector_class
+    for key in _REAL_CONNECTOR_KEYS:
+        if key == "nutanix":
+            continue
+        assert get_connector_class(key).MANAGES_VOLUME_PRESENTATION is False, key
+
+
+# --------------------------------------------------------------------------- #
+# power_state vocabulary — enforced for EVERY connector
+#
+# The contract is "running" | "stopped" | "unknown", and
+# MigrationRunner._await_power polls for exactly those. The Nutanix connector
+# returned AHV's own "on"/"off", so the poll never matched and every migration
+# failed at the final power-on with "did not reach running after N start
+# attempts" — after the data had already been copied.
+# --------------------------------------------------------------------------- #
+_POWER_WORDS = {"running", "stopped", "unknown"}
+
+
+@pytest.mark.parametrize("connector_key", _REAL_CONNECTOR_KEYS)
+async def test_power_state_uses_the_contract_vocabulary(connector_key, make_context):
+    import inspect
+
+    from phif.connectors.registry import get_connector_class
+
+    cls = get_connector_class(connector_key)
+    src = inspect.getsource(cls.power_state)
+    # Every literal this method can return must be contract vocabulary. Catches
+    # a connector that mirrors its platform's own words instead.
+    returned = set(re.findall(r'return\s+"([a-z]+)"', src))
+    returned |= set(re.findall(r'"([a-z]+)"\s+if\s+', src))
+    returned |= set(re.findall(r'else\s+"([a-z]+)"', src))
+    bad = {w for w in returned if w not in _POWER_WORDS}
+    assert not bad, (
+        f"{connector_key}.power_state may return {sorted(bad)}, which "
+        f"_await_power will never match; use {sorted(_POWER_WORDS)}")
+
+
+async def test_nutanix_power_state_maps_ahv_on_to_running(make_context):
+    """AHV reports ON/OFF; the connector must translate."""
+    from phif.connectors.nutanix.connector import NutanixConnector
+
+    class Runner:
+        mock = False
+        dry_run = False
+
+        def __init__(self, state):
+            self.state = state
+
+        async def run_http(self, method, url, **kw):
+            return {"status_code": 200, "text": "", "headers": {"etag": "e"},
+                    "json": {"data": {"extId": "vm-1", "name": "x",
+                                      "powerState": self.state, "disks": [],
+                                      "nics": []}}}
+
+    for ahv_state, expected in (("ON", "running"), ("OFF", "stopped")):
+        ctx = make_context(connector_key="nutanix",
+                           connection={"pc_host": "pc", "pc_user": "u"},
+                           secrets={"pc_password": "p"})
+        ctx.runner = Runner(ahv_state)
+        assert await NutanixConnector(ctx).power_state("vm-1") == expected
+
+
+# --------------------------------------------------------------------------- #
+# dry_run — validate and PLAN, change nothing
+#
+# `dry_run` previously existed only on OperationRequest, so sending it to
+# /api/migrations was accepted and ignored. That reads as a safe rehearsal while
+# running for real: it shut a source VM down and created a destination VM.
+# --------------------------------------------------------------------------- #
+_ARRAY_MUTATIONS = {
+    "copy_volume", "delete_volume", "create_volume", "connect_volume",
+    "disconnect_volume", "connect_volume_to_group", "disconnect_volume_from_group",
+    "connect_to_array", "replicate_volume_to", "import_replicated_volume",
+    "extend_volume", "create_snapshot", "clone_volume", "rename_volume",
+}
+
+
+async def test_dry_run_mutates_nothing_same_array():
+    array, src, dst = _build()
+    _make_real([src, dst])
+    res = await _svc(src, dst, mode="move", dry_run=True).run()
+    assert res.success, res.message
+
+    # No array mutation of any kind.
+    mutations = [op for op, _ in array.calls if op in _ARRAY_MUTATIONS]
+    assert mutations == [], f"dry run mutated the array: {mutations}"
+    # Source volumes still present (a real move eradicates them).
+    assert "vol-a" in array.volumes and "vol-b" in array.volumes
+    # The source VM was never stopped and the destination VM never deleted for real.
+    assert "stop" not in src.events, src.events
+    assert not any(e.startswith("delete:") for e in src.events), src.events
+
+
+async def test_dry_run_still_validates_and_plans():
+    """It must do the real READS — preflight, spec capture, network checks — so
+    a dry run genuinely catches misconfiguration."""
+    array, src, dst = _build()
+    _make_real([src, dst])
+    logs: list[str] = []
+
+    svc = _svc(src, dst, mode="move", dry_run=True)
+    orig_emit = svc.emit
+
+    async def _capture(line):
+        logs.append(line)
+        await orig_emit(line)
+
+    svc.emit = _capture
+    res = await svc.run()
+    assert res.success, res.message
+    assert "capture" in src.events, "spec capture must still run"
+    joined = "\n".join(logs)
+    assert "[dry-run] would" in joined, "a dry run should read as a plan"
+    assert "copy" in joined.lower()
+
+
+async def test_dry_run_reports_a_preflight_problem():
+    """A dry run must surface the same failures a real run would."""
+    array, src, dst = _build()
+    _make_real([src, dst])
+    dst._hg = ""     # destination has no host group and does not self-manage
+    res = await _svc(src, dst, mode="move", dry_run=True).run()
+    assert not res.success
+    assert "host group" in res.message.lower()
+
+
+async def test_dry_run_keeps_connector_reads_real():
+    """A dry run must NOT stub out the connectors' I/O.
+
+    Setting ctx.dry_run / runner.dry_run makes every read return mock data, so
+    the run validates nothing — it showed up live as a bogus "destination
+    network(s) not found". Mutations are skipped at their call sites instead,
+    which is also safer: most connectors ignore ctx.dry_run entirely.
+    """
+    array, src, dst = _build()
+    _make_real([src, dst])
+    svc = _svc(src, dst, mode="move", dry_run=True)
+    assert svc.dry_run is True
+    assert src.ctx.dry_run is False and dst.ctx.dry_run is False
+    assert src.ctx.runner.dry_run is False and dst.ctx.runner.dry_run is False
+    # The real reads still happen.
+    res = await svc.run()
+    assert res.success, res.message
+    assert "capture" in src.events
+
+
+async def test_real_run_is_unaffected_by_the_dry_run_plumbing():
+    """Regression guard: the normal path must still mutate."""
+    array, src, dst = _build()
+    _make_real([src, dst])
+    res = await _svc(src, dst, mode="move").run()
+    assert res.success, res.message
+    assert src.ctx.dry_run is False and dst.ctx.dry_run is False
+    copies = [kw for op, kw in array.calls if op == "copy_volume"]
+    assert copies and all(kw["overwrite"] for kw in copies)
+    erased = [kw.get("name") for op, kw in array.calls if op == "delete_volume"]
+    assert set(erased) >= {"vol-a", "vol-b"}

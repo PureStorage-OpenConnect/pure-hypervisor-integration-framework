@@ -139,6 +139,14 @@ class NutanixConnector(HypervisorConnector):
     # compatibility matrix); iSCSI is not a supported transport for this path.
     SUPPORTED_PROTOCOLS = {Protocol.NVME_TCP}
 
+    # Prism allocates the backing FlashArray volume for each vDisk and connects
+    # it to its own stargate hosts, so there is no operator-managed host group
+    # here — observed live, a vDisk's volume is connected to a host named
+    # `<realm>::nx-<id>-<n>-stargate-1`. Migration is otherwise identical to
+    # every other destination: create the VM, create its disks, then let the
+    # source volume be copied on top of them.
+    MANAGES_VOLUME_PRESENTATION = True
+
     def __init__(self, ctx: ConnectorContext):
         super().__init__(ctx)
         self._etags: dict[str, str] = {}
@@ -284,7 +292,25 @@ class NutanixConnector(HypervisorConnector):
             tag = (res.get("headers") or {}).get("etag")
             if tag:
                 self._etags[etag_for] = tag
+            elif method.upper() != "GET":
+                # A successful mutation invalidates the ETag it consumed; drop it
+                # so the next mutation re-reads rather than replaying a stale one
+                # (which v4 rejects with 412 Precondition Failed).
+                self._etags.pop(etag_for, None)
         return res.get("json") or {}
+
+    async def _ensure_vm_etag(self, vm_ref: str) -> None:
+        """Make sure an ``If-Match`` ETag is cached for ``vm_ref``.
+
+        v4 refuses a mutation without ``If-Match`` — **HTTP 428 Precondition
+        Required**. Only a GET yields the ETag, and :meth:`create_vm` learns the
+        new VM's id from the finished task without ever fetching the VM, so the
+        first mutation on a freshly created VM had nothing to send. That is what
+        made a migration fail with 428 on the very first disk add, and made the
+        rollback's delete fail the same way, orphaning the destination VM.
+        """
+        if vm_ref not in self._etags:
+            await self._find_vm(vm_ref)
 
     @staticmethod
     def _task_ref(payload: Any) -> str | None:
@@ -776,10 +802,18 @@ class NutanixConnector(HypervisorConnector):
 
     # ------------------------------------------------------- VM lifecycle ---
     async def power_state(self, vm_ref: str) -> str:
+        """``running`` | ``stopped`` per the base contract.
+
+        AHV's own vocabulary is ON/OFF, but PHIF's contract — and what
+        ``MigrationRunner._await_power`` polls for — is running/stopped.
+        Returning "on"/"off" here meant the poll never matched and every
+        migration died at the end with "destination VM did not reach running
+        after N start attempts", long after the data had been copied.
+        """
         if self._mock_or_dry():
-            return "off"
+            return "stopped"
         vm = await self._find_vm(vm_ref)
-        return "on" if (vm.get("powerState") or "").upper() == "ON" else "off"
+        return "running" if (vm.get("powerState") or "").upper() == "ON" else "stopped"
 
     async def stop_vm(self, vm_ref: str, *, force: bool = False) -> OpResult:
         if self._mock_or_dry():
@@ -787,10 +821,11 @@ class NutanixConnector(HypervisorConnector):
         # A guest-coordinated shutdown needs Nutanix Guest Tools; power-off is
         # always available. Migration is a cold cutover, so either is acceptable
         # and power-off is the one that cannot hang.
+        await self._ensure_vm_etag(vm_ref)
         action = "power-off" if force else "shutdown"
         try:
             payload = await self._api(
-                "POST", f"/api/vmm/v4.0/ahv/config/vms/{vm_ref}/${action}",
+                "POST", f"/api/vmm/v4.0/ahv/config/vms/{vm_ref}/$actions/{action}",
                 etag_for=vm_ref)
             await self._await_task(payload, f"{action} VM {vm_ref}")
         except Exception as exc:
@@ -801,7 +836,7 @@ class NutanixConnector(HypervisorConnector):
             # The failed attempt consumed the ETag, so re-read before retrying.
             await self._find_vm(vm_ref)
             payload = await self._api(
-                "POST", f"/api/vmm/v4.0/ahv/config/vms/{vm_ref}/$power-off",
+                "POST", f"/api/vmm/v4.0/ahv/config/vms/{vm_ref}/$actions/power-off",
                 etag_for=vm_ref)
             await self._await_task(payload, f"power-off VM {vm_ref}")
         return OpResult.ok(f"VM {vm_ref} powered off")
@@ -809,8 +844,9 @@ class NutanixConnector(HypervisorConnector):
     async def start_vm(self, vm_ref: str) -> OpResult:
         if self._mock_or_dry():
             return OpResult.ok(f"Dry-run: would power on VM {vm_ref}")
+        await self._ensure_vm_etag(vm_ref)
         payload = await self._api(
-            "POST", f"/api/vmm/v4.0/ahv/config/vms/{vm_ref}/$power-on",
+            "POST", f"/api/vmm/v4.0/ahv/config/vms/{vm_ref}/$actions/power-on",
             etag_for=vm_ref)
         await self._await_task(payload, f"power-on VM {vm_ref}")
         return OpResult.ok(f"VM {vm_ref} powered on")
@@ -885,6 +921,15 @@ class NutanixConnector(HypervisorConnector):
                            artifacts={"vm_ref": vm_ref, "name": vm_name})
 
     async def _cluster_ext_id(self, *, prefer: str = "") -> str:
+        """Resolve a cluster to its extId, accepting either a NAME or an extId.
+
+        Both spellings reach here. The connection's ``cluster`` field is a name
+        typed by the operator, but the migration wizard passes back
+        ``placement["cluster"]``, which is the ``cluster.id`` this connector
+        itself returned from :meth:`list_placements` — an extId. Matching only
+        on name made a migration fail with "No AHV cluster named
+        '000651b8-…' found in Prism Central".
+        """
         want = (prefer or self.ctx.target.get("cluster") or "").strip()
         payload = await self._api("POST", "/api/nutanix/v3/clusters/list",
                                   json_body={"kind": "cluster", "length": 50})
@@ -898,12 +943,13 @@ class NutanixConnector(HypervisorConnector):
             if not nodes:
                 continue
             ext_id = (e.get("metadata") or {}).get("uuid") or ""
-            if want and status.get("name") != want:
+            if want and want not in (status.get("name"), ext_id):
                 continue
             candidates.append((status.get("name"), ext_id))
         if not candidates:
             raise ConnectionValidationError(
-                f"No AHV cluster{f' named {want!r}' if want else ''} found in Prism Central")
+                f"No AHV cluster{f' matching {want!r} (name or extId)' if want else ''} "
+                f"found in Prism Central")
         if len(candidates) > 1:
             names = ", ".join(sorted(n for n, _ in candidates))
             raise ConnectionValidationError(
@@ -942,6 +988,9 @@ class NutanixConnector(HypervisorConnector):
         if self._mock_or_dry():
             return f"mock-nx-{vm_ref}-{order}-dt"
 
+        # _target_container may short-circuit on the configured/placement
+        # container without reading the VM, so make sure an ETag exists.
+        await self._ensure_vm_etag(vm_ref)
         container = await self._target_container(vm_ref)
         body = {
             "backingInfo": {
@@ -1067,6 +1116,7 @@ class NutanixConnector(HypervisorConnector):
                 f"Refusing to delete VM {vm_ref} with keep_disks=True: deleting an AHV "
                 f"VM also deletes its vDisks and their FlashArray volumes. Detach the "
                 f"disks in Prism first, or call again with keep_disks=False.")
+        await self._ensure_vm_etag(vm_ref)
         payload = await self._api("DELETE", f"/api/vmm/v4.0/ahv/config/vms/{vm_ref}",
                                   etag_for=vm_ref)
         await self._await_task(payload, f"delete VM {vm_ref}")

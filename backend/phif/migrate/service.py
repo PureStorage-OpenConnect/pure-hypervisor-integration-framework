@@ -69,10 +69,33 @@ class MigrationService:
         # FlashArrays, so the volume must be sent to the destination array via
         # replication (then copied locally there) instead of re-mapped/cloned.
         self.cross_array = bool(self.options.get("cross_array"))
+        # Dry run: validate and PLAN the whole migration without changing
+        # anything. Propagated onto both connector contexts (and their runners)
+        # so each connector's own _mock_or_dry() guard turns its mutations into
+        # no-ops; the array operations this service performs directly are
+        # guarded by _skip() below, since no connector sees those.
+        self.dry_run = bool(self.options.get("dry_run"))
+        # NOTE: dry run deliberately does NOT set ctx.dry_run / runner.dry_run on
+        # the connectors. Doing so stubs out their SSH/HTTP, so every read
+        # (validate_connection, capture_vm_spec, list_networks, placements)
+        # returns mock data and the run validates nothing — observed as a bogus
+        # "destination network(s) not found". Reads stay real; each mutation is
+        # skipped explicitly at its call site, which also means a connector that
+        # ignores ctx.dry_run (most of them do) cannot mutate anything.
 
     # ----------------------------------------------------------- helpers ---
     def _opt(self, key: str, default: Any) -> Any:
         return self.options.get(key, default)
+
+    async def _skip(self, what: str) -> bool:
+        """True when a real mutation must be skipped because this is a dry run.
+
+        Logs what WOULD have happened, so a dry run reads as a plan.
+        """
+        if not self.dry_run:
+            return False
+        await self.emit(f"[dry-run] would {what}")
+        return True
 
     @staticmethod
     def _is_mock(conn: HypervisorConnector) -> bool:
@@ -207,17 +230,28 @@ class MigrationService:
 
         self.source_hg = self.src.migration_host_group()
         self.dest_hg = self.dst.migration_host_group()
-        if not self.dest_hg:
+        # A platform that presents volumes itself (Nutanix AHV: Prism creates the
+        # backing volume for each vDisk and connects it to its own stargate
+        # hosts) has no operator-managed host group. The migration itself is
+        # unchanged — the destination VM and disks are still created and the
+        # source volume still copied on top of them — only this precondition
+        # does not apply.
+        if self.dst.MANAGES_VOLUME_PRESENTATION:
+            await self.emit(
+                f"[migrate] {self.dst.key} presents FlashArray volumes itself; "
+                f"no destination host group is required")
+        elif not self.dest_hg:
             raise MigrationError("destination hypervisor has no FlashArray host group configured")
 
         # The destination host group must already have member hosts. In mock/
         # dry-run the array has no persisted state, so this is advisory only.
-        pf = await self.dst.require_host_objects(self.dest_hg)
-        if not pf.success:
-            if self._is_mock(self.dst):
-                await self.emit(f"[mock] skipping host-group readiness: {pf.message}")
-            else:
-                raise MigrationError(f"destination not ready: {pf.message}")
+        if self.dest_hg:
+            pf = await self.dst.require_host_objects(self.dest_hg)
+            if not pf.success:
+                if self._is_mock(self.dst):
+                    await self.emit(f"[mock] skipping host-group readiness: {pf.message}")
+                else:
+                    raise MigrationError(f"destination not ready: {pf.message}")
 
         # Every mapped destination network must resolve.
         nets = {n.get("id") for n in await self.dst.list_networks()}
@@ -250,6 +284,10 @@ class MigrationService:
         Storage vMotion to RDM/vVol to give each disk a per-disk FA volume
         identity before _resolve_volumes tries to look them up on the array."""
         assert self.spec is not None
+        if await self._skip(
+                "let the source connector stage per-disk FlashArray volumes "
+                "(e.g. vSphere VMFS -> RDM clone)"):
+            return
         updated = await self.src.prepare_source_disks(self.spec, self.options)
         if updated is not None and updated is not self.spec:
             self.spec = updated
@@ -332,6 +370,18 @@ class MigrationService:
                      "convert_to_vmfs": self._opt("convert_to_vmfs", False),
                      "vmfs_datastore": self._opt("vmfs_datastore", None)}
         placement = {k: v for k, v in placement.items() if v}
+        if self.dry_run:
+            # Do NOT call create_vm: only the Nutanix connector guards its own
+            # mutations on ctx.dry_run, so proxmox/xcpng/vsphere would really
+            # create a VM here. Synthesize a planned ref and carry on so the
+            # rest of the plan still runs.
+            await self.emit(
+                f"[dry-run] would create destination VM {self.spec.name!r} "
+                f"({self.spec.vcpus} vCPU, "
+                f"{(self.spec.memory_bytes or 0) // 1024**3} GiB, "
+                f"firmware={self.spec.firmware}) placement={placement or '{}'}")
+            self.dest_vm_ref = f"dry-run-{self.spec.name}"
+            return
         r = await self.dst.create_vm(self.spec, network_map=self.network_map,
                                      placement=placement or None)
         if not r.success:
@@ -379,6 +429,8 @@ class MigrationService:
         if not self._source_was_running:
             await self.emit("[copy] source already stopped")
             return
+        if await self._skip(f"shut down source VM {self.vm_ref}"):
+            return
         r = await self.src.stop_vm(self.vm_ref, force=bool(self._opt("force_stop", False)))
         if not r.success:
             raise MigrationError(f"failed to stop source for a clean copy: {r.message}")
@@ -415,34 +467,52 @@ class MigrationService:
             size = disk.identity.size_bytes or 0
             # 1. The destination plugin creates + attaches a managed disk (its FA
             #    volume is named/owned in the plugin's namespace).
-            dest_vol = await self.dst.create_managed_disk(
-                self.dest_vm_ref, size_bytes=size, order=disk.order, boot=disk.boot)
+            if self.dry_run:
+                dest_vol = f"dry-run-dest-{self.dest_vm_ref}-disk{disk.order}"
+                await self.emit(
+                    f"[dry-run] would create destination disk {disk.order} "
+                    f"({size} B) and receive a backing volume for it")
+            else:
+                dest_vol = await self.dst.create_managed_disk(
+                    self.dest_vm_ref, size_bytes=size, order=disk.order,
+                    boot=disk.boot)
             self.dest_disks.append(DiskSpec(
                 identity=DiskIdentity(fa_volume=dest_vol), bus=disk.bus,
                 order=disk.order, boot=disk.boot, source_ref=disk.source_ref))
             # 2. Resolve the copy SOURCE on the destination array.
             if self.cross_array:
-                suffix = await self.src.ctx.array.replicate_volume_to(
-                    disk.identity.fa_volume, self._dst_array_name, pg)
-                await self._await_replication(
-                    dst_arr, self._src_array_name, pg, suffix)
-                copy_src = "%s:%s.%s.%s" % (
-                    self._src_array_name, pg, suffix,
-                    disk.identity.fa_volume.split("/")[-1])
+                if await self._skip(
+                        f"replicate {disk.identity.fa_volume} to "
+                        f"{self._dst_array_name} and await the replica"):
+                    # Nothing is replicated, so name the local volume as the
+                    # notional copy source for the plan's log.
+                    copy_src = disk.identity.fa_volume
+                else:
+                    suffix = await self.src.ctx.array.replicate_volume_to(
+                        disk.identity.fa_volume, self._dst_array_name, pg)
+                    await self._await_replication(
+                        dst_arr, self._src_array_name, pg, suffix)
+                    copy_src = "%s:%s.%s.%s" % (
+                        self._src_array_name, pg, suffix,
+                        disk.identity.fa_volume.split("/")[-1])
             else:
                 copy_src = disk.identity.fa_volume
             # 3. Overwrite the managed dest volume's DATA from the source (the dest
             #    volume keeps its identity, so the attached device stays valid).
-            await dst_arr.copy_volume(copy_src, dest_vol, overwrite=True)
-            await self.emit(
-                f"[migrate] copied {copy_src} -> {dest_vol} "
-                "(overwrite; source volume untouched)")
+            if not await self._skip(
+                    f"copy {copy_src} -> {dest_vol} (overwrite)"):
+                await dst_arr.copy_volume(copy_src, dest_vol, overwrite=True)
+                await self.emit(
+                    f"[migrate] copied {copy_src} -> {dest_vol} "
+                    "(overwrite; source volume untouched)")
 
     async def _finalize_dest_disks(self) -> None:
         """Let the destination connector reconcile its attached disks with the
         backing volumes after the copy (e.g. vSphere re-creates RDM pointers whose
         geometry went stale when copy-with-overwrite resized the dest volume)."""
         assert self.dest_vm_ref is not None
+        if await self._skip("reconcile destination disks with their backing volumes"):
+            return
         r = await self.dst.finalize_destination_disks(self.dest_vm_ref, self.dest_disks)
         if not r.success:
             raise MigrationError(f"failed to finalize destination disks: {r.message}")
@@ -459,6 +529,8 @@ class MigrationService:
         # Target VMFS: an explicit vmfs_datastore option, else the operator's wizard
         # "Storage" selection (dest_storage).
         ds = self._opt("vmfs_datastore", None) or self._opt("dest_storage", None)
+        if await self._skip("convert destination disks to native format"):
+            return
         r = await self.dst.convert_disks_to_native(
             self.dest_vm_ref, self.dest_disks, datastore=ds)
         if not r.success:
@@ -488,6 +560,9 @@ class MigrationService:
         key = await dst_arr.get_connection_key()
         repl_addrs = await dst_arr.get_replication_addresses()
         mgmt = getattr(dst_arr, "endpoint", "")
+        if await self._skip(f"connect array {self._src_array_name} -> "
+                            f"{self._dst_array_name} for replication"):
+            return
         await src_arr.connect_to_array(mgmt, key, repl_addrs)
         await self.emit(
             f"[xarray] connected source array {self._src_array_name!r} -> "
@@ -518,6 +593,8 @@ class MigrationService:
     async def _set_boot(self, disks: list) -> None:
         await self._phase("set destination boot order")
         assert self.dest_vm_ref is not None
+        if await self._skip("set the destination boot order"):
+            return
         r = await self.dst.set_boot_order(self.dest_vm_ref, disks)
         if not r.success:
             raise MigrationError(f"failed to set boot order: {r.message}")
@@ -551,6 +628,11 @@ class MigrationService:
         # assemble), so the first start can fail with "device not present". Each
         # start re-triggers the host-side rescan, so RETRY start + wait until the
         # VM reaches running (the device settles within a few attempts).
+        if self.dry_run:
+            await self.emit(
+                f"[dry-run] would power on destination VM {self.dest_vm_ref} "
+                f"and wait for it to reach running")
+            return
         if self._is_mock(self.dst):
             await self.dst.start_vm(self.dest_vm_ref)
             await self.emit(f"[mock] skipping power-on wait for {self.dest_vm_ref}")
@@ -590,6 +672,13 @@ class MigrationService:
         await self._phase("finalize: remove source VM and delete source volume(s)")
         assert self.spec is not None
         source_vm_removed = False
+        if self.dry_run:
+            vols = [d.identity.fa_volume for d in self.spec.disks
+                    if d.identity.fa_volume]
+            await self.emit(
+                f"[dry-run] would remove source VM {self.vm_ref} and then delete "
+                f"+ eradicate {', '.join(vols) or 'its volumes'}")
+            return
         try:
             r = await self.src.delete_vm(self.vm_ref, keep_disks=True)
             source_vm_removed = bool(r.success)
@@ -623,6 +712,8 @@ class MigrationService:
             if not vol or not arr:
                 continue
             try:
+                if await self._skip(f"delete + eradicate source volume {vol}"):
+                    continue
                 if self.source_hg:
                     await arr.disconnect_volume_from_group(self.source_hg, vol)
                 await arr.delete_volume(vol, eradicate=True)

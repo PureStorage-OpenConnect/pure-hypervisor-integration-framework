@@ -298,9 +298,12 @@ async def create_migration(body: MigrationCreate,
     from phif.migrate.service import run_migration
 
     try:
+        opts = dict(body.options or {})
+        if body.dry_run:
+            opts["dry_run"] = True
         migration_id, job_id = await run_migration(
             session, source_hv_id=source.id, dest_hv_id=dest.id,
-            vm_ref=body.vm_ref, network_map=body.network_map, options=body.options)
+            vm_ref=body.vm_ref, network_map=body.network_map, options=opts)
     except ValueError as exc:
         raise HTTPException(400, str(exc)) from exc
     return {"migration_id": migration_id, "job_id": job_id}

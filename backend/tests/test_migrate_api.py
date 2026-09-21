@@ -373,3 +373,52 @@ async def test_cross_array_replication_connection_is_accepted(client, monkeypatc
         assert "replication connection" in entry["reason"]
     finally:
         monkeypatch.setattr(MockFlashArrayClient, "list_array_connections", orig)
+
+
+# --------------------------------------------------------------------------- #
+# dry_run must reach the runner
+#
+# `dry_run` lived only on OperationRequest, so POSTing it to /api/migrations was
+# accepted and silently dropped — which reads exactly like a safe rehearsal
+# while the migration runs for real.
+# --------------------------------------------------------------------------- #
+def test_migration_create_accepts_dry_run():
+    from phif.api.schemas import MigrationCreate
+
+    m = MigrationCreate(source_hypervisor_id="a", dest_hypervisor_id="b",
+                        vm_ref="1", dry_run=True)
+    assert m.dry_run is True, "dry_run must be a real field, not an ignored extra"
+    # Default stays off so nothing changes for existing callers.
+    assert MigrationCreate(source_hypervisor_id="a", dest_hypervisor_id="b",
+                           vm_ref="1").dry_run is False
+
+
+async def test_dry_run_is_threaded_into_runner_options(client, monkeypatch):
+    """The endpoint must put dry_run where MigrationService reads it."""
+    import phif.migrate.service as msvc
+
+    seen: dict = {}
+
+    async def _capture(session, **kw):
+        seen.update(kw)
+        return "mig-1", "job-1"
+
+    monkeypatch.setattr(msvc, "run_migration", _capture)
+
+    a1 = await _mk_array(client, "10.0.9.1")
+    src = await _make_hv(client, "proxmox", a1, "dr1")
+    dst = await _make_hv(client, "xcpng", a1, "dr2")
+
+    r = await client.post("/api/migrations", json={
+        "source_hypervisor_id": src, "dest_hypervisor_id": dst,
+        "vm_ref": "100", "network_map": {}, "dry_run": True})
+    assert r.status_code == 202, r.text
+    assert (seen.get("options") or {}).get("dry_run") is True, seen.get("options")
+
+    # And a normal request must NOT set it.
+    seen.clear()
+    r = await client.post("/api/migrations", json={
+        "source_hypervisor_id": src, "dest_hypervisor_id": dst,
+        "vm_ref": "101", "network_map": {}})
+    assert r.status_code == 202, r.text
+    assert not (seen.get("options") or {}).get("dry_run")

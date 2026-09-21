@@ -202,7 +202,7 @@ async def test_etag_is_read_from_header_and_replayed_as_if_match(make_context):
     assert c._etags["vm-ext-1"] == "etag-abc"
 
     await c.start_vm("vm-ext-1")
-    power_on = [x for x in ctx.runner.calls if "$power-on" in x["url"]][0]
+    power_on = [x for x in ctx.runner.calls if "$actions/power-on" in x["url"]][0]
     assert power_on["headers"].get("If-Match") == "etag-abc"
     # Mutations also carry an idempotency key so a retry cannot double-apply.
     assert power_on["headers"].get("NTNX-Request-Id")
@@ -679,3 +679,85 @@ async def test_delete_unconnected_volume_needs_no_disconnect(make_context, mock_
     assert r.success
     assert r.artifacts["disconnected"] == []
     assert "disconnect_volume" not in [op for op, _ in mock_array.calls]
+
+
+# --------------------------------------------------------------------------- #
+# If-Match / power-action paths — both broke a live migration
+# --------------------------------------------------------------------------- #
+async def test_mutation_fetches_an_etag_when_none_is_cached(make_context):
+    """create_vm learns the VM id from a task and never GETs the VM, so nothing
+    had cached an ETag. v4 then rejected the first disk add with HTTP 428
+    Precondition Required, and the rollback's delete failed the same way,
+    orphaning the destination VM."""
+    created = _vm_payload([_disk(LEAF_VOL, index=0, disk_id="new-disk")])
+    ctx = _ctx(make_context)
+    ctx.runner = TaskRunner(vm_doc=created)
+    c = NutanixConnector(ctx)
+    # Simulate a freshly created VM: id known, ETag never fetched.
+    assert "vm-ext-1" not in c._etags
+
+    await c.create_managed_disk("vm-ext-1", size_bytes=DISK_SIZE, order=0)
+
+    urls = [x["url"] for x in ctx.runner.calls]
+    methods = [x["method"] for x in ctx.runner.calls]
+    # A GET of the VM must precede the disk POST, so If-Match can be sent.
+    get_i = next(i for i, (m, u) in enumerate(zip(methods, urls))
+                 if m == "GET" and u.endswith("/vms/vm-ext-1"))
+    post_i = next(i for i, (m, u) in enumerate(zip(methods, urls))
+                  if m == "POST" and u.endswith("/disks"))
+    assert get_i < post_i, "must GET the VM for an ETag before mutating it"
+    post = ctx.runner.calls[post_i]
+    assert post["headers"].get("If-Match") == "e1"
+
+
+async def test_delete_vm_fetches_an_etag(make_context):
+    ctx = _ctx(make_context)
+    ctx.runner = TaskRunner(vm_doc=_vm_payload([]))
+    c = NutanixConnector(ctx)
+    await c.delete_vm("vm-ext-1", keep_disks=False)
+    delete = [x for x in ctx.runner.calls if x["method"] == "DELETE"][0]
+    assert delete["headers"].get("If-Match") == "e1"
+
+
+@pytest.mark.parametrize("method,expected", [
+    ("start_vm", "$actions/power-on"),
+    ("stop_vm", "$actions/shutdown"),
+])
+async def test_power_actions_use_the_actions_segment(make_context, method, expected):
+    """v4 power actions live under `$actions/`. The bare `/$power-on` form
+    returns 404 — verified against a live Prism Central, where `$power-on` 404s
+    while `$actions/power-on` returns 428 (valid path, needs If-Match)."""
+    ctx = _ctx(make_context)
+    ctx.runner = TaskRunner(vm_doc=_vm_payload([]))
+    c = NutanixConnector(ctx)
+    await getattr(c, method)("vm-ext-1")
+    posts = [x["url"] for x in ctx.runner.calls if x["method"] == "POST"]
+    assert any(expected in u for u in posts), posts
+    # And never the bare form that 404s.
+    assert not any("/$power-on" in u or "/$power-off" in u for u in posts), posts
+
+
+async def test_stale_etag_is_dropped_after_a_mutation(make_context):
+    """A mutation invalidates the ETag it consumed; replaying it would get a
+    412 Precondition Failed, so the cache entry must be cleared."""
+    ctx = _ctx(make_context)
+
+    class NoEtagOnMutation(TaskRunner):
+        async def run_http(self, method, url, *, headers=None, json_body=None, **kw):
+            self.calls.append({"method": method, "url": url,
+                               "headers": headers or {}, "json_body": json_body})
+            if "/config/tasks/" in url:
+                return {"status_code": 200, "json": self.task_doc, "text": "",
+                        "headers": {}}
+            if method == "GET":
+                return {"status_code": 200, "json": _vm_payload([]), "text": "",
+                        "headers": {"etag": "e1"}}
+            # Mutation replies carry no ETag.
+            return {"status_code": 202, "json": _task_ref(), "text": "", "headers": {}}
+
+    ctx.runner = NoEtagOnMutation()
+    c = NutanixConnector(ctx)
+    await c._find_vm("vm-ext-1")
+    assert c._etags["vm-ext-1"] == "e1"
+    await c.delete_vm("vm-ext-1", keep_disks=False)
+    assert "vm-ext-1" not in c._etags, "stale ETag must not be replayed"
