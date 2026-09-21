@@ -195,8 +195,20 @@ captured with every disk resolved to its pod-scoped FA volume and serial
 (including a 4-disk VM), and 2 correctly rejected for holding Volume Group
 disks.
 
-The **write paths** — `create_vm`, `create_managed_disk`, `detach_volumes`,
-power operations and `delete_vm` — are covered by unit tests against recorded
-payload shapes but have **not** been exercised against live hardware. The lab
-cluster available for this work is also 2-node, below the supported 3-node
-minimum, so it is suitable for API validation but is not a supportability claim.
+The **write paths** have since been exercised on hardware too:
+`create_vm` (correct vCPU/RAM/firmware), `create_managed_disk` (vDisk added and
+its backing FA volume read back), `capture_vm_spec` over the new disk,
+`detach_volumes`, the `keep_disks=True` refusal, and `delete_vm` — with the test
+VM and its volume cleaned up afterwards.
+
+**Migration** is validated by **dry run in both directions** (AHV as source and
+as destination), which exercises preflight, spec capture, volume resolution and
+the full plan without mutating anything. A complete migration has **not** been
+run end to end yet.
+
+Caveats on the validation environment: the cluster used for the read-path work
+was 2-node, below the supported 3-node minimum; the later write-path and
+migration work used a 3-node cluster. The Proxmox peer reaches the shared array
+over a **single** iSCSI path (three of the array's four portals are firewalled
+from it), so destination boots may need a retry while multipath assembles — not
+representative of a production data path.

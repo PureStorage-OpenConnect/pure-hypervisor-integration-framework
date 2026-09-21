@@ -128,7 +128,7 @@ exercisable without real infrastructure.
 | vSphere | `ga` | vSphere Client plugin + VASA/vVols, FlashArray REST, `purestorage.flasharray` | ✅ live vCenter: plugin + VASA deploy, VMFS/RDM datastore provisioning, vVol→FA volume resolution for migration |
 | OpenShift | `ga` | Portworx (px-csi) via the Portworx Operator (manifest) + StorageCluster (Portworx Central spec or generated FADA) | ✅ live OCP 4.22 single-node + FA-X20R3: Portworx install, PVC provision |
 | OpenStack | `ga` | Cinder driver (PureISCSI/FC/NVME) | ✅ live controller: Cinder backend deploy → configure → provision |
-| Nutanix AHV | `preview` | FlashArray as AHV **external storage** (NVMe-oF/TCP): one FA volume per vDisk, driven via Prism Central. External-storage registration itself is **not** implemented — do it in Prism. | ⚠️ live Prism Central (AOS 7.6 / AHV 11.2): inventory + vDisk→FA volume resolution. Write paths unit-tested only |
+| Nutanix AHV | `preview` | FlashArray as AHV **external storage** (NVMe-oF/TCP): one FA volume per vDisk, driven via Prism Central. External-storage registration itself is **not** implemented — do it in Prism. | ⚠️ live Prism Central (AOS 7.6 / AHV 11.2, 3-node) + FA-XL130 on Purity 6.12.2: inventory, vDisk→FA volume resolution, and VM lifecycle (create VM, add disk, detach, delete) all exercised on hardware. Migration validated by **dry run in both directions**; no full migration executed end-to-end yet |
 
 Proxmox, XCP-ng, and HPE VME follow the CSI/Cinder "storage plugin" model — each VM disk is
 its own FlashArray volume presented directly to the VM (no LVM), with snapshots and
