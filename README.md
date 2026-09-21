@@ -263,6 +263,16 @@ down automatically after the conversion (and on rollback).
 Being an experimental project, PHIF has rough edges that are documented rather
 than hidden. Please read these before filing an issue.
 
+* **Nutanix must not be used as a *move* migration source.** `_finalize_move`
+  calls `delete_vm(keep_disks=True)`, treats failure as a warning, then
+  eradicates the source volumes anyway. AHV cannot delete a VM while keeping its
+  vDisks, so the connector refuses that call — leaving the source VM alive with
+  its volumes eradicated. Use Nutanix as a migration **destination**, or as a
+  **copy** source (which leaves the source untouched), until the migration
+  service can handle a source that cannot preserve its disks.
+* **Nutanix: detaching a vDisk does not free its FlashArray volume.** The volume
+  stays live and connected to a stargate host; teardown must clean it up
+  explicitly.
 * **Nutanix: registering the FlashArray as external storage is not implemented.**
   The Nutanix connector consumes an AHV cluster that *already* has the array
   registered as an External Storage target; it does not perform that

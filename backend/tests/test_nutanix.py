@@ -374,3 +374,168 @@ async def test_prepare_source_disks_is_a_noop(make_context, mock_array):
     assert r.artifacts["volumes"] == [SCOPED_VOL]
     # Nothing was provisioned or copied on the array.
     assert not any(op.startswith("create_volume") for op, _ in mock_array.calls)
+
+
+# --------------------------------------------------------------------------- #
+# Asynchronous task handling
+#
+# Every v4 mutation returns a prism.v4.config.TaskReference whose extId is an
+# ergon task id -- NOT the entity id. Treating it as a VM id yields a 400 on the
+# next call and orphans the VM, which is exactly what happened on first
+# hardware run.
+# --------------------------------------------------------------------------- #
+TASK_ID = "ZXJnb24=:0efcd3f5-cafb-5f22-871e-ad4e401a2c5a"
+NEW_VM_ID = "bcd6b6b6-9ebb-44b2-6f87-3429239b9840"
+
+
+def _task_ref():
+    return {"data": {"$objectType": "prism.v4.config.TaskReference",
+                     "extId": TASK_ID}}
+
+
+def _task(status="SUCCEEDED", entities=(("vmm:ahv:config:vm", NEW_VM_ID),),
+          **extra):
+    return {"data": {"extId": TASK_ID, "status": status,
+                     "entitiesAffected": [{"rel": r, "extId": e}
+                                          for r, e in entities],
+                     **extra}}
+
+
+class TaskRunner(StubRunner):
+    """Serves a TaskReference for mutations and a task document for polling."""
+
+    def __init__(self, task_doc=None, vm_doc=None, statuses=None):
+        super().__init__()
+        self.task_doc = task_doc if task_doc is not None else _task()
+        self.vm_doc = vm_doc
+        # Optional sequence of statuses to walk through before the task_doc.
+        self.statuses = list(statuses or [])
+
+    async def run_http(self, method, url, *, headers=None, json_body=None, **kw):
+        self.calls.append({"method": method, "url": url, "headers": headers or {},
+                           "json_body": json_body})
+        if "/config/tasks/" in url:
+            if self.statuses:
+                return {"status_code": 200, "text": "", "headers": {},
+                        "json": _task(status=self.statuses.pop(0), entities=())}
+            return {"status_code": 200, "json": self.task_doc, "text": "", "headers": {}}
+        if method in ("POST", "DELETE") and "/tasks" not in url:
+            return {"status_code": 202, "json": _task_ref(), "text": "", "headers": {}}
+        if self.vm_doc is not None:
+            return {"status_code": 200, "json": self.vm_doc, "text": "",
+                    "headers": {"etag": "e1"}}
+        return {"status_code": 200, "json": {}, "text": "", "headers": {}}
+
+
+async def test_create_vm_takes_id_from_task_not_from_post(make_context, monkeypatch):
+    """Regression: the POST's extId is the TASK id. Using it as the VM id 400s
+    on the next call and leaves the VM orphaned on the cluster."""
+    from phif.migrate.spec import VmSpec
+
+    ctx = _ctx(make_context)
+    ctx.runner = TaskRunner()
+    c = NutanixConnector(ctx)
+    monkeypatch.setattr(c, "_cluster_ext_id", lambda: _async("cluster-ext-1"))
+
+    r = await c.create_vm(VmSpec(name="app-01", source_ref="s", vcpus=2,
+                                 memory_bytes=2 * 1024**3))
+    assert r.success
+    assert r.artifacts["vm_ref"] == NEW_VM_ID
+    assert r.artifacts["vm_ref"] != TASK_ID
+    # The task must actually have been polled.
+    assert any("/config/tasks/" in x["url"] for x in ctx.runner.calls)
+
+
+def _async(value):
+    async def _inner(*a, **k):
+        return value
+    return _inner()
+
+
+async def test_create_vm_fails_when_task_names_no_vm(make_context, monkeypatch):
+    """A succeeded task with no VM entity means the id is unknown -- say so
+    rather than returning a bogus reference."""
+    from phif.migrate.spec import VmSpec
+
+    ctx = _ctx(make_context)
+    ctx.runner = TaskRunner(task_doc=_task(entities=()))
+    c = NutanixConnector(ctx)
+    monkeypatch.setattr(c, "_cluster_ext_id", lambda: _async("cluster-ext-1"))
+
+    r = await c.create_vm(VmSpec(name="app-01", source_ref="s"))
+    assert not r.success
+    assert "affected entities" in r.message
+
+
+async def test_await_task_raises_on_failed_task(make_context):
+    """A v4 mutation returns 202 on acceptance, so a FAILED task would
+    otherwise look like success."""
+    from phif.connectors.base import ConnectorError
+
+    ctx = _ctx(make_context)
+    ctx.runner = TaskRunner(task_doc=_task(status="FAILED",
+                                           legacyErrorMessage="boom"))
+    c = NutanixConnector(ctx)
+    with pytest.raises(ConnectorError) as e:
+        await c._await_task(_task_ref(), "create VM x")
+    assert "FAILED" in str(e.value)
+    assert "boom" in str(e.value)
+
+
+async def test_await_task_polls_until_terminal(make_context, monkeypatch):
+    ctx = _ctx(make_context)
+    ctx.runner = TaskRunner(statuses=["QUEUED", "RUNNING"])
+    c = NutanixConnector(ctx)
+    monkeypatch.setattr("phif.connectors.nutanix.connector.TASK_POLL_SECONDS", 0)
+
+    task = await c._await_task(_task_ref(), "create VM x")
+    assert (task.get("status") or "").upper() == "SUCCEEDED"
+    polls = [x for x in ctx.runner.calls if "/config/tasks/" in x["url"]]
+    assert len(polls) == 3  # QUEUED, RUNNING, then SUCCEEDED
+
+
+async def test_await_task_ignores_non_task_response(make_context):
+    """Reads return plain bodies, not TaskReferences -- those must pass through."""
+    c = NutanixConnector(_ctx(make_context))
+    assert await c._await_task({"data": {"extId": "plain-vm-id"}}, "x") == {}
+    assert await c._await_task({}, "x") == {}
+
+
+async def test_task_id_is_url_encoded_when_polled(make_context):
+    """The ergon task id contains '=' and ':'."""
+    ctx = _ctx(make_context)
+    ctx.runner = TaskRunner()
+    c = NutanixConnector(ctx)
+    await c._await_task(_task_ref(), "x")
+    poll = [x for x in ctx.runner.calls if "/config/tasks/" in x["url"]][0]
+    assert "ZXJnb24%3D%3A" in poll["url"]
+
+
+async def test_delete_vm_awaits_its_task(make_context):
+    ctx = _ctx(make_context)
+    ctx.runner = TaskRunner(vm_doc=_vm_payload([]))
+    c = NutanixConnector(ctx)
+    r = await c.delete_vm("vm-ext-1", keep_disks=False)
+    assert r.success
+    assert any("/config/tasks/" in x["url"] for x in ctx.runner.calls)
+
+
+async def test_create_managed_disk_awaits_before_reading_back(make_context):
+    """The disk and its array volume do not exist until the task finishes, so
+    reading the VM back too early finds nothing."""
+    ctx = _ctx(make_context)
+    ctx.runner = TaskRunner(
+        vm_doc=_vm_payload([_disk(LEAF_VOL, index=0, disk_id="new-disk")]))
+    c = NutanixConnector(ctx)
+
+    r = await c.create_managed_disk("vm-ext-1", size_bytes=DISK_SIZE, order=0)
+    assert r.success
+    urls = [x["url"] for x in ctx.runner.calls]
+    post_i = next(i for i, u in enumerate(urls)
+                  if u.endswith("/disks"))
+    task_i = next(i for i, u in enumerate(urls) if "/config/tasks/" in u)
+    readback_i = max(i for i, u in enumerate(urls) if u.endswith("/vms/vm-ext-1"))
+    assert post_i < task_i < readback_i, "must poll the task between POST and read-back"
+
+
+DISK_SIZE = 107374182400

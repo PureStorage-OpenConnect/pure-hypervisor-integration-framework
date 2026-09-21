@@ -116,6 +116,28 @@ index is preserved from the source.
 vDisks and with them the backing FA volumes, so the request cannot be honoured
 and is not silently ignored.
 
+### ⚠️ Nutanix is not safe as a *move* migration source
+
+`MigrationRunner._finalize_move` calls
+`src.delete_vm(vm_ref, keep_disks=True)` and treats a failure as a **warning**,
+then unconditionally runs `delete_volume(vol, eradicate=True)` over the source
+disks. Because AHV cannot delete a VM while keeping its vDisks, this connector
+refuses that call — so a Nutanix *move* source ends in the worst possible state:
+**the source VM survives while its backing volumes are eradicated.**
+
+Until the migration service can handle a source that cannot preserve its disks,
+use Nutanix as a migration **destination**, or as a **copy** source
+(`_finalize_copy` leaves the source untouched). Do not run a *move* with Nutanix
+as the source.
+
+### Detaching a vDisk does not free its array volume
+
+Measured on AOS 7.6 / Purity 6.12.2: after `detach_volumes` removed a vDisk, the
+backing FlashArray volume stayed **live and still connected to a Nutanix
+stargate host** for at least 150 s, and was not reclaimed. `delete_vm` did not
+reclaim it either. Teardown and rollback paths should therefore expect to clean
+up FA volumes themselves rather than assume Nutanix releases them.
+
 ## API notes
 
 Verified against Prism Central on **AOS 7.6 / AHV 11.2**.

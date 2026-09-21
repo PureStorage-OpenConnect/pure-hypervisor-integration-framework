@@ -53,7 +53,10 @@ disk resolution — migrating one would copy metadata over a data disk.
 
 from __future__ import annotations
 
+import asyncio
 import base64
+import time
+import urllib.parse
 import uuid
 from typing import Any
 
@@ -63,7 +66,7 @@ from phif.connectors.base import (
     ClusterNode,
     ConnectionValidationError,
     ConnectorContext,
-    DiscoveryKind,
+    ConnectorError,
     FieldType,
     FormField,
     HypervisorConnector,
@@ -86,6 +89,23 @@ MD_VOLUME_SUFFIX = "-md"
 
 # Hard ceiling v4 enforces on `$limit`; a larger value is rejected with a 400.
 V4_PAGE_LIMIT = 100
+
+# Every v4 mutation is asynchronous: it returns a prism.v4.config.TaskReference
+# whose extId is an *ergon task* id (base64("ergon") + ":" + uuid), NOT the
+# entity's id. The created object's id arrives in the finished task's
+# `entitiesAffected`. Treating the returned extId as a VM id yields a 400 on the
+# next call and leaves the VM orphaned.
+TASK_PATH = "/api/prism/v4.0/config/tasks"
+TASK_POLL_SECONDS = 2
+TASK_TIMEOUT_SECONDS = 600
+# `rel` on an affected entity, e.g. "vmm:ahv:config:vm".
+VM_ENTITY_REL_SUFFIX = ":vm"
+
+# Floor Nutanix applies to the FlashArray volume behind a vDisk. Measured on
+# AOS 7.6 / Purity 6.12.2: a 1 GiB vDisk request and a 15 MiB vDisk both landed
+# on 2 GiB volumes, while normal sizes matched the request exactly. So a backing
+# volume is never smaller than the vDisk, but may be larger.
+NUTANIX_MIN_FA_VOLUME_BYTES = 2 * 1024**3
 
 
 class NutanixConnector(HypervisorConnector):
@@ -261,6 +281,56 @@ class NutanixConnector(HypervisorConnector):
             if tag:
                 self._etags[etag_for] = tag
         return res.get("json") or {}
+
+    @staticmethod
+    def _task_ref(payload: Any) -> str | None:
+        """Return the task id if ``payload`` is a v4 TaskReference, else None."""
+        data = (payload or {}).get("data") if isinstance(payload, dict) else None
+        if not isinstance(data, dict):
+            return None
+        if "TaskReference" in (data.get("$objectType") or ""):
+            return data.get("extId")
+        return None
+
+    async def _await_task(self, payload: Any, what: str) -> dict[str, Any]:
+        """Block until the task a mutation returned reaches a terminal state.
+
+        Returns the finished task (whose ``entitiesAffected`` carries the ids of
+        anything created), or ``{}`` when the response was not a task — which is
+        also the mock/dry-run case, where the runner returns an empty body.
+
+        Raises on a FAILED task: a v4 mutation returns 202 the moment it is
+        accepted, so without this a failure looks like success and the next call
+        fails somewhere far less obvious.
+        """
+        task_id = self._task_ref(payload)
+        if not task_id:
+            return {}
+        quoted = urllib.parse.quote(task_id, safe="")
+        deadline = time.monotonic() + TASK_TIMEOUT_SECONDS
+        while True:
+            body = await self._api("GET", f"{TASK_PATH}/{quoted}")
+            task = (body or {}).get("data") or {}
+            status = (task.get("status") or "").upper()
+            if status == "SUCCEEDED":
+                return task
+            if status in ("FAILED", "CANCELED", "CANCELLED"):
+                detail = (task.get("errorMessages") or task.get("legacyErrorMessage")
+                          or task.get("operationDescription") or "")
+                raise ConnectorError(f"{what}: Nutanix task {status} — {detail}")
+            if time.monotonic() > deadline:
+                raise ConnectorError(
+                    f"{what}: Nutanix task did not finish within "
+                    f"{TASK_TIMEOUT_SECONDS}s (last status {status or 'unknown'})")
+            await asyncio.sleep(TASK_POLL_SECONDS)
+
+    @staticmethod
+    def _entity_from_task(task: dict[str, Any], rel_suffix: str) -> str | None:
+        """Pull the id of an affected entity whose ``rel`` ends with ``rel_suffix``."""
+        for ent in task.get("entitiesAffected") or []:
+            if (ent.get("rel") or "").endswith(rel_suffix):
+                return ent.get("extId")
+        return None
 
     async def _api_list(self, path: str) -> list[dict[str, Any]]:
         """GET every page of a v4 list endpoint and return the concatenated data.
@@ -657,24 +727,30 @@ class NutanixConnector(HypervisorConnector):
         # and power-off is the one that cannot hang.
         action = "power-off" if force else "shutdown"
         try:
-            await self._api("POST",
-                            f"/api/vmm/v4.0/ahv/config/vms/{vm_ref}/${action}",
-                            etag_for=vm_ref)
+            payload = await self._api(
+                "POST", f"/api/vmm/v4.0/ahv/config/vms/{vm_ref}/${action}",
+                etag_for=vm_ref)
+            await self._await_task(payload, f"{action} VM {vm_ref}")
         except Exception as exc:
             if force:
                 raise
             await self.ctx.emit(
                 f"[nutanix] guest shutdown failed ({exc}); falling back to power-off")
-            await self._api("POST",
-                            f"/api/vmm/v4.0/ahv/config/vms/{vm_ref}/$power-off",
-                            etag_for=vm_ref)
+            # The failed attempt consumed the ETag, so re-read before retrying.
+            await self._find_vm(vm_ref)
+            payload = await self._api(
+                "POST", f"/api/vmm/v4.0/ahv/config/vms/{vm_ref}/$power-off",
+                etag_for=vm_ref)
+            await self._await_task(payload, f"power-off VM {vm_ref}")
         return OpResult.ok(f"VM {vm_ref} powered off")
 
     async def start_vm(self, vm_ref: str) -> OpResult:
         if self._mock_or_dry():
             return OpResult.ok(f"Dry-run: would power on VM {vm_ref}")
-        await self._api("POST", f"/api/vmm/v4.0/ahv/config/vms/{vm_ref}/$power-on",
-                        etag_for=vm_ref)
+        payload = await self._api(
+            "POST", f"/api/vmm/v4.0/ahv/config/vms/{vm_ref}/$power-on",
+            etag_for=vm_ref)
+        await self._await_task(payload, f"power-on VM {vm_ref}")
         return OpResult.ok(f"VM {vm_ref} powered on")
 
     async def create_vm(self, spec: VmSpec, *, name: str = "",
@@ -726,10 +802,16 @@ class NutanixConnector(HypervisorConnector):
             f"{spec.memory_bytes // 1024**3} GiB, firmware={spec.firmware})")
         payload = await self._api("POST", "/api/vmm/v4.0/ahv/config/vms",
                                   json_body=body)
-        vm_ref = ((payload or {}).get("data") or {}).get("extId") or ""
+        # The POST returns a task, not the VM. The VM's id only exists once the
+        # task finishes, in entitiesAffected.
+        task = await self._await_task(payload, f"create VM {vm_name}")
+        vm_ref = self._entity_from_task(task, VM_ENTITY_REL_SUFFIX)
         if not vm_ref:
             return OpResult.fail(
-                f"Prism accepted the create for {vm_name} but returned no VM extId")
+                f"Nutanix reported the create of {vm_name} as succeeded but named no "
+                f"VM in the task's affected entities; the VM may exist and need "
+                f"removing by hand")
+        await self.ctx.emit(f"[nutanix] created VM {vm_name} ({vm_ref})")
         return OpResult.ok(f"Created VM {vm_name}",
                            artifacts={"vm_ref": vm_ref, "name": vm_name})
 
@@ -775,6 +857,15 @@ class NutanixConnector(HypervisorConnector):
         owns the volume, and an array-side resize behind its back leaves Prism's
         view of the disk wrong. A size mismatch before the overwrite is the most
         common way this workflow is gotten wrong.
+
+        The backing volume is **not always byte-identical** to the request.
+        Measured on AOS 7.6 / Purity 6.12.2: volumes match the vDisk exactly at
+        normal sizes, but Nutanix applies a floor of
+        ``NUTANIX_MIN_FA_VOLUME_BYTES`` (a 1 GiB request produced a 2 GiB
+        volume; a 15 MiB vDisk also sat on a 2 GiB volume) and rounds some sizes
+        up slightly. The artifacts therefore report the volume's real size as
+        ``fa_size_bytes`` alongside the requested ``size_bytes``, so a caller
+        that must reconcile sizes can see both.
         """
         if self._mock_or_dry():
             vol = f"mock-nx-{vm_ref}-{order}-dt"
@@ -796,8 +887,13 @@ class NutanixConnector(HypervisorConnector):
         await self.ctx.emit(
             f"[nutanix] adding vDisk index={order} size={size_bytes} B "
             f"container={container}")
-        await self._api("POST", f"/api/vmm/v4.0/ahv/config/vms/{vm_ref}/disks",
-                        json_body=body, etag_for=vm_ref)
+        payload = await self._api(
+            "POST", f"/api/vmm/v4.0/ahv/config/vms/{vm_ref}/disks",
+            json_body=body, etag_for=vm_ref)
+        # Wait for the add to actually complete; the disk (and its array volume)
+        # do not exist until the task finishes, so reading the VM back too early
+        # finds nothing.
+        await self._await_task(payload, f"add vDisk {order} to VM {vm_ref}")
 
         # Read the VM back to learn which FA volume Nutanix created for the disk.
         vm = await self._find_vm(vm_ref)
@@ -814,12 +910,28 @@ class NutanixConnector(HypervisorConnector):
                     f"external volume — the storage container {container!r} is not "
                     f"FlashArray-backed, so there is no array volume to migrate into.")
             await self.ctx.emit(f"[nutanix] vDisk {order} -> FA volume {volume}")
+            # Report the volume's real size next to the requested one: Nutanix
+            # floors small disks at NUTANIX_MIN_FA_VOLUME_BYTES and rounds some
+            # sizes up, so the two are not always equal.
+            fa_size = None
+            if self.ctx.array is not None:
+                resolved = await self.ctx.array.resolve_volume_name(volume)
+                vol = await self.ctx.array.get_volume(resolved) if resolved else None
+                if vol:
+                    volume = vol["name"]
+                    fa_size = vol.get("size")
+                    if fa_size and int(fa_size) != int(size_bytes):
+                        await self.ctx.emit(
+                            f"[nutanix] note: requested {size_bytes} B but Nutanix "
+                            f"provisioned a {fa_size} B volume (its own minimum / "
+                            f"rounding); the volume is never smaller than the vDisk")
             return OpResult.ok(
                 f"Created vDisk {order} backed by {volume}",
                 artifacts={"fa_volume": volume, "volume": volume,
                            "disk_ext_id": (disk.get("backingInfo") or {})
                            .get("diskExtId", ""),
-                           "size_bytes": int(size_bytes)},
+                           "size_bytes": int(size_bytes),
+                           "fa_size_bytes": int(fa_size) if fa_size else None},
             )
         return OpResult.fail(
             f"Created vDisk index {order} on VM {vm_ref} but could not find it when "
@@ -888,8 +1000,9 @@ class NutanixConnector(HypervisorConnector):
                 f"Refusing to delete VM {vm_ref} with keep_disks=True: deleting an AHV "
                 f"VM also deletes its vDisks and their FlashArray volumes. Detach the "
                 f"disks in Prism first, or call again with keep_disks=False.")
-        await self._api("DELETE", f"/api/vmm/v4.0/ahv/config/vms/{vm_ref}",
-                        etag_for=vm_ref)
+        payload = await self._api("DELETE", f"/api/vmm/v4.0/ahv/config/vms/{vm_ref}",
+                                  etag_for=vm_ref)
+        await self._await_task(payload, f"delete VM {vm_ref}")
         return OpResult.ok(f"Deleted VM {vm_ref} and its vDisks")
 
     # --------------------------------------------------------- migration ----
@@ -927,10 +1040,11 @@ class NutanixConnector(HypervisorConnector):
             disk_ext_id = (disk.get("backingInfo") or {}).get("diskExtId")
             if not disk_ext_id:
                 continue
-            await self._api(
+            payload = await self._api(
                 "DELETE",
                 f"/api/vmm/v4.0/ahv/config/vms/{vm_ref}/disks/{disk_ext_id}",
                 etag_for=vm_ref)
+            await self._await_task(payload, f"detach disk {disk_ext_id}")
             detached.append(volume or disk_ext_id)
             # The ETag changes with every mutation, so refresh it before the next.
             vm = await self._find_vm(vm_ref)
