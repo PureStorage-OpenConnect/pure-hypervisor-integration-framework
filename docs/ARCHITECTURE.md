@@ -142,6 +142,7 @@ Two storage models appear across the connectors:
 | **Proxmox** | Custom `purefa` PVE storage plugin | SSH install + `storage.cfg` + multipath; array host-group registration |
 | **XCP-ng** | Custom **SMAPIv3** driver (volume + datapath + host plugin) | `xe sm`/`sr-create` over SSH/XAPI; array host-group registration |
 | **HPE VME** | Native **Morpheus/VME storage plugin** (Java/Groovy) | upload the plugin JAR via the VME Manager API; register the storage server |
+| **Nutanix AHV** | FlashArray as AHV **external storage** (NVMe-oF/TCP) | none — registration is performed in Prism; the connector consumes an already-registered array via Prism Central |
 
 See [`../README.md`](../README.md#connector-status) for the current maturity and
 hardware-validation status of each, and `docs/connectors/<key>.md` for the

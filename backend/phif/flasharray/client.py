@@ -56,6 +56,7 @@ class FlashArrayClient(Protocol):
     async def get_volume(self, name: str) -> dict | None: ...
     async def find_volume_name_by_serial(self, serial: str) -> str | None: ...
     async def find_volume_by_vvol_id(self, vvol_id: str) -> dict | None: ...
+    async def resolve_volume_name(self, name: str) -> str | None: ...
     async def extend_volume(self, name: str, size: str | int) -> dict: ...
     async def delete_volume(self, name: str, *, eradicate: bool = False) -> None: ...
     async def create_snapshot(self, volume: str, suffix: str | None = None) -> dict: ...
@@ -534,6 +535,49 @@ class PureFlashArrayClient:
             return {"name": vol["name"], "serial": vol.get("serial")}
         return None
 
+    async def resolve_volume_name(self, name: str) -> str | None:
+        """Return the volume's real array name, resolving a pod/realm prefix.
+
+        A volume inside a pod is named ``pod::volume`` on the array (and
+        ``realm::pod::volume`` inside a realm), but a hypervisor often reports
+        only the bare leaf name. Nutanix does exactly this: Prism shows
+        ``nx-<id>-<n>-dt`` while the array holds
+        ``<realm>::<pod>::nx-<id>-<n>-dt``.
+
+        Tries the name as given first, then falls back to a suffix match.
+        Returns None when nothing matches, and raises when the suffix is
+        ambiguous — guessing between two pods could attach the wrong data.
+        """
+        want = (name or "").strip()
+        if not want:
+            return None
+        if vol := await self.get_volume(want):
+            if not vol.get("destroyed"):
+                return vol["name"]
+        if "::" in want:
+            # Already fully qualified and not found; a suffix search would only
+            # match the same thing.
+            return None
+
+        leaf = want.replace("'", "")
+        if leaf != want:
+            # A quote cannot appear in an FA volume name and would break the
+            # filter expression, so treat it as unmatchable rather than escaping.
+            return None
+        items = await self._call(lambda c: c.get_volumes(
+            filter=f"name='*::{leaf}'"))
+        live = [v for v in (items or [])
+                if not getattr(v, "destroyed", False)
+                and (getattr(v, "name", "") or "").split("::")[-1] == leaf]
+        if not live:
+            return None
+        if len(live) > 1:
+            names = ", ".join(sorted(getattr(v, "name", "") for v in live))
+            raise FlashArrayApiError(
+                f"Volume name {want!r} is ambiguous on this array — it matches "
+                f"{len(live)} pod-scoped volumes ({names}). Cannot choose safely.")
+        return getattr(live[0], "name", None)
+
     async def extend_volume(self, name, size) -> dict:
         from pypureclient.flasharray import VolumePatch
 
@@ -938,6 +982,24 @@ class MockFlashArrayClient:
             if (v.get("serial") or "").lower() == want:
                 return name
         return None
+
+    async def resolve_volume_name(self, name):
+        """Mock scoped-name resolution: exact match, then a ``::`` suffix match."""
+        self._rec("resolve_volume_name", name=name)
+        want = (name or "").strip()
+        if not want:
+            return None
+        if want in self.volumes:
+            return want
+        if "::" in want:
+            return None
+        matches = [n for n in self.volumes if n.split("::")[-1] == want]
+        if len(matches) > 1:
+            raise FlashArrayApiError(
+                f"Volume name {want!r} is ambiguous on this array — it matches "
+                f"{len(matches)} pod-scoped volumes ({', '.join(sorted(matches))}). "
+                f"Cannot choose safely.")
+        return matches[0] if matches else None
 
     async def find_volume_by_vvol_id(self, vvol_id):
         """Mock vVol resolution, backed by the ``vvol_ids`` map.

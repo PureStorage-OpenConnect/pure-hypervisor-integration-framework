@@ -339,3 +339,92 @@ async def test_find_volume_by_vvol_id_blank_input(monkeypatch):
     assert await c.find_volume_by_vvol_id(None) is None
     # Cheap guard: no API traffic for an input that cannot match.
     assert not fake.calls
+
+
+# --------------------------------------------------------------------------- #
+# Pod/realm-scoped volume-name resolution
+# --------------------------------------------------------------------------- #
+class _ScopedSDK(_FakeSDK):
+    """Volume inventory where names may be pod- or realm-scoped."""
+
+    def __init__(self, vols=None, **kw):
+        super().__init__(**kw)
+        self._vols = vols or []
+
+    def get_volumes(self, names=None, filter=None, **kw):
+        self.calls.append(("get_volumes", tuple(names or []), filter))
+        if names:
+            items = [v for v in self._vols if v.name in names]
+            if not items:
+                return _Resp(status_code=400, errors="Volume does not exist")
+            return _Resp(items=items)
+        if filter:
+            # Mirror the server's "name='*::<leaf>'" wildcard behaviour.
+            m = re.search(r"name='\*::([^']*)'", filter)
+            if m:
+                leaf = m.group(1)
+                return _Resp(items=[v for v in self._vols
+                                    if v.name.split("::")[-1] == leaf
+                                    and "::" in v.name])
+        return _Resp(items=self._vols)
+
+
+LEAF = "nx-1234567890123456789-51-dt"
+SCOPED = f"FSA76::AHV76::{LEAF}"
+
+
+async def test_resolve_volume_name_exact_match_wins(monkeypatch):
+    fake = _ScopedSDK(vols=[_Vol(LEAF, "AAA")])
+    c = _client(fake, monkeypatch)
+    assert await c.resolve_volume_name(LEAF) == LEAF
+    # An exact hit must not trigger a wildcard search.
+    assert all(x[2] is None for x in fake.calls if x[0] == "get_volumes")
+
+
+async def test_resolve_volume_name_finds_pod_scoped(monkeypatch):
+    """Nutanix reports the leaf name while the array holds pod::realm::leaf."""
+    fake = _ScopedSDK(vols=[_Vol(SCOPED, "BBB")])
+    c = _client(fake, monkeypatch)
+    assert await c.resolve_volume_name(LEAF) == SCOPED
+
+
+async def test_resolve_volume_name_ambiguous_raises(monkeypatch):
+    """The same leaf in two pods cannot be chosen between — picking one could
+    attach another tenant's data."""
+    fake = _ScopedSDK(vols=[_Vol(f"podA::{LEAF}", "AAA"),
+                            _Vol(f"podB::{LEAF}", "BBB")])
+    c = _client(fake, monkeypatch)
+    with pytest.raises(FlashArrayApiError) as e:
+        await c.resolve_volume_name(LEAF)
+    assert "ambiguous" in str(e.value).lower()
+
+
+async def test_resolve_volume_name_skips_destroyed(monkeypatch):
+    fake = _ScopedSDK(vols=[_Vol(SCOPED, "BBB", destroyed=True)])
+    c = _client(fake, monkeypatch)
+    assert await c.resolve_volume_name(LEAF) is None
+
+
+async def test_resolve_volume_name_already_qualified_not_found(monkeypatch):
+    """A fully-qualified name that misses should not fall back to a suffix
+    search, which could only match the same volume."""
+    fake = _ScopedSDK(vols=[])
+    c = _client(fake, monkeypatch)
+    assert await c.resolve_volume_name(SCOPED) is None
+    assert not [x for x in fake.calls if x[0] == "get_volumes" and x[2]]
+
+
+async def test_resolve_volume_name_rejects_quote(monkeypatch):
+    """A quote cannot occur in an FA volume name and would break the filter
+    expression, so it is treated as unmatchable rather than escaped."""
+    fake = _ScopedSDK(vols=[_Vol(SCOPED, "BBB")])
+    c = _client(fake, monkeypatch)
+    assert await c.resolve_volume_name("nx-1' or name='*") is None
+
+
+async def test_resolve_volume_name_blank(monkeypatch):
+    fake = _ScopedSDK(vols=[])
+    c = _client(fake, monkeypatch)
+    assert await c.resolve_volume_name("") is None
+    assert await c.resolve_volume_name(None) is None
+    assert not fake.calls

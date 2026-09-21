@@ -19,7 +19,7 @@
 One framework + web UI to connect a FlashArray, mint the API keys integrations
 need, attach hypervisors, deploy the right storage integration onto each, and run
 day-2 storage operations — across **vSphere, OpenShift, OpenStack, Proxmox,
-XCP-ng, and HPE VM Essentials**.
+XCP-ng, HPE VM Essentials, and Nutanix AHV**.
 
 PHIF does not reinvent the underlying integrations. It **automates the deployment
 and configuration** of them (vSphere plugin + VASA, the Kubernetes/OpenShift CSI
@@ -37,7 +37,8 @@ capability-driven interface.
 └──────────────┘     │  • Job engine (Ansible / SSH / HTTP + logs) │
                      │  • Encrypted secrets vault                  │
                      │  • Connectors: vsphere, openshift, openstack│
-                     │    proxmox, xcpng, hpevme (+ example)       │
+                     │    proxmox, xcpng, hpevme, nutanix         │
+                     │    (+ example)                              │
                      └─────────────────────────────────────────────┘
                                   │ REST / SSH / Ansible / k8s API
                      ┌────────────┴────────────┐
@@ -127,13 +128,16 @@ exercisable without real infrastructure.
 | vSphere | `ga` | vSphere Client plugin + VASA/vVols, FlashArray REST, `purestorage.flasharray` | ✅ live vCenter: plugin + VASA deploy, VMFS/RDM datastore provisioning, vVol→FA volume resolution for migration |
 | OpenShift | `ga` | Portworx (px-csi) via the Portworx Operator (manifest) + StorageCluster (Portworx Central spec or generated FADA) | ✅ live OCP 4.22 single-node + FA-X20R3: Portworx install, PVC provision |
 | OpenStack | `ga` | Cinder driver (PureISCSI/FC/NVME) | ✅ live controller: Cinder backend deploy → configure → provision |
+| Nutanix AHV | `preview` | FlashArray as AHV **external storage** (NVMe-oF/TCP): one FA volume per vDisk, driven via Prism Central. External-storage registration itself is **not** implemented — do it in Prism. | ⚠️ live Prism Central (AOS 7.6 / AHV 11.2): inventory + vDisk→FA volume resolution. Write paths unit-tested only |
 
 Proxmox, XCP-ng, and HPE VME follow the CSI/Cinder "storage plugin" model — each VM disk is
 its own FlashArray volume presented directly to the VM (no LVM), with snapshots and
 clones performed on the array.
 
-**VM migration is validated in both directions between all supported hypervisors**,
-on live hardware sharing one FlashArray.
+**VM migration is validated in both directions between Proxmox, XCP-ng, HPE VME,
+OpenShift Virtualization and vSphere**, on live hardware sharing one FlashArray.
+The Nutanix connector's migration paths are **not** hardware-validated yet — see
+the connector table above.
 
 ## VM Migration
 
@@ -259,6 +263,16 @@ down automatically after the conversion (and on rollback).
 Being an experimental project, PHIF has rough edges that are documented rather
 than hidden. Please read these before filing an issue.
 
+* **Nutanix: registering the FlashArray as external storage is not implemented.**
+  The Nutanix connector consumes an AHV cluster that *already* has the array
+  registered as an External Storage target; it does not perform that
+  registration (array service account, realm, pod, NVMe-oF/TCP interface
+  configuration, and the Prism Element registration). Do that in Prism first —
+  `validate_connection` fails with an explicit message if it is missing. The
+  connector accordingly does not advertise `deploy_plugin`, `configure`,
+  `provision_datastore`, `provision_volume`, `connectivity` or `host_register`.
+  Its VM-lifecycle and migration **write** paths are also unit-tested only, not
+  yet hardware-validated.
 * **vVol datastore provisioning is not implemented.** vVols are deprecated, so
   `provision_datastore` refuses `type=vvol` (it previously fell through to the
   VMFS path and produced a VMFS datastore merely *labelled* vvol). Create the
