@@ -124,7 +124,7 @@ exercisable without real infrastructure.
 | Proxmox | `ga` | Custom PVE storage plugin (`purefa`): one FA volume per disk, array snapshots/clones | ✅ live 2-node PVE cluster |
 | XCP-ng | `ga` | Custom SMAPIv3 driver (volume + datapath + host plugin): one FA volume per VDI, array snapshots/clones | ✅ live 2-host pool, XCP-ng 8.3 / xapi 25.6 |
 | HPE VME | `ga` | Native Morpheus/VME storage plugin (Java/Groovy under `connectors/hpevme/files/morpheus-plugin/`): per-VM-disk FA volumes, array-offloaded snap/clone/resize, VME-native libvirt attach via `MvmProvisionFacet`. PHIF connector uploads the plugin (`deploy`) + registers the storage server (`configure`). | ✅ live VME appliance: provision, image deploy, clone-from-VM, snapshot create/revert/delete |
-| vSphere | `ga` | vSphere Client plugin + VASA/vVols, FlashArray REST, `purestorage.flasharray` | ✅ live vCenter: plugin + VASA deploy, VMFS/RDM datastore provisioning |
+| vSphere | `ga` | vSphere Client plugin + VASA/vVols, FlashArray REST, `purestorage.flasharray` | ✅ live vCenter: plugin + VASA deploy, VMFS/RDM datastore provisioning, vVol→FA volume resolution for migration |
 | OpenShift | `ga` | Portworx (px-csi) via the Portworx Operator (manifest) + StorageCluster (Portworx Central spec or generated FADA) | ✅ live OCP 4.22 single-node + FA-X20R3: Portworx install, PVC provision |
 | OpenStack | `ga` | Cinder driver (PureISCSI/FC/NVME) | ✅ live controller: Cinder backend deploy → configure → provision |
 
@@ -187,8 +187,15 @@ datastore, not a 1:1 FA volume.
   form), resolves the 24-hex serial against the **connected** FlashArray, and uses that
   volume. A disk (RDM or vVol) whose serial does **not** resolve to a volume on the
   connected array (a non-Everpure RDM, or an Everpure volume on a different array) is rejected
-  with a clear preflight error. *(Native vVol-source resolution is not yet implemented —
-  a vVol-backed VM is currently rejected as unmappable rather than silently failing.)*
+  with a clear preflight error.
+* **vVol** disks are resolved exactly, with no size or name guessing. A vVol has no
+  device serial of its own, so PHIF reads the disk's vVol id
+  (`backingObjectId`, e.g. `rfc4122.<uuid>`) from vCenter and looks it up against the
+  FlashArray tag `PURE_VVOL_ID` in the `vasa-integration.purestorage.com` namespace —
+  the mapping the Everpure VASA provider maintains. That yields the backing volume and
+  its serial, after which a vVol disk migrates on the same path as an RDM. A vVol id
+  that does not resolve on the connected array (commonly because the vVol lives on a
+  *different* array) is reported as unmappable rather than guessed at.
 * **VMFS** disks have no per-disk FA volume. PHIF provisions a new FA volume per disk,
   presents it to the ESXi host as a raw device mapping (RDM), and clones the VMDK's
   data onto it with `vmkfstools` (VAAI/XCOPY-accelerated on the array). For a *copy*
@@ -252,9 +259,12 @@ down automatically after the conversion (and on rollback).
 Being an experimental project, PHIF has rough edges that are documented rather
 than hidden. Please read these before filing an issue.
 
-* **vSphere vVol sources are rejected, not migrated.** Native vVol-source
-  resolution is unimplemented; a vVol-backed VM fails preflight with a clear
-  error rather than silently mismigrating.
+* **vVol datastore provisioning is not implemented.** vVols are deprecated, so
+  `provision_datastore` refuses `type=vvol` (it previously fell through to the
+  VMFS path and produced a VMFS datastore merely *labelled* vvol). Create the
+  vVol datastore in vCenter — storage provider plus storage container — and PHIF
+  will migrate VMs on and off it. Registering/refreshing the VASA provider is
+  still supported via the `deploy` and `configure` actions.
 * **Migration is cold-cutover only** and requires source and destination to share
   one physical array. There is no live migration and no cross-array path.
 * **UEFI NVRAM / efivars are not transferred** — a UEFI destination VM gets a

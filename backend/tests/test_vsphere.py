@@ -421,6 +421,31 @@ async def test_provision_nfs_missing_params(make_context):
     assert not r.success
 
 
+async def test_provision_vvol_datastore_is_rejected(make_context):
+    """type='vvol' must fail loudly, not quietly build a VMFS datastore.
+
+    It previously fell through to the VMFS branch, producing a real VMFS
+    datastore merely labelled "vvol" plus a stray backing volume.
+    """
+    ctx = _ctx(make_context)
+    c = VSphereConnector(ctx)
+    r = await c.provision_datastore(name="vv1", size="1T", host_group="hg1", type="vvol")
+    assert not r.success
+    assert "not implemented" in r.message.lower()
+    # No backing volume left behind, and nothing connected to the host group.
+    assert "vv1" not in ctx.array.volumes
+    assert not any(op == "connect_volume" for op, _ in ctx.array.calls)
+
+
+def test_vvol_not_offered_as_a_datastore_type():
+    """The UI must not offer a type the connector refuses."""
+    spec = next(a for a in VSphereConnector.action_schemas()
+                if a.id == "provision_datastore")
+    type_field = next(f for f in spec.fields if f.name == "type")
+    assert "vvol" not in (type_field.options or [])
+    assert {"vmfs", "nfs"} <= set(type_field.options or [])
+
+
 # ---- volume / day-2 ops ----
 async def test_provision_volume(make_context):
     ctx = _ctx(make_context)

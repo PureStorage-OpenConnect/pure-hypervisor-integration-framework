@@ -16,6 +16,7 @@ calls to a thread so they never block the event loop.
 from __future__ import annotations
 
 import asyncio
+import re
 from typing import Any, Protocol
 
 from phif.config import get_settings
@@ -54,6 +55,7 @@ class FlashArrayClient(Protocol):
     async def create_volume(self, name: str, size: str | int) -> dict: ...
     async def get_volume(self, name: str) -> dict | None: ...
     async def find_volume_name_by_serial(self, serial: str) -> str | None: ...
+    async def find_volume_by_vvol_id(self, vvol_id: str) -> dict | None: ...
     async def extend_volume(self, name: str, size: str | int) -> dict: ...
     async def delete_volume(self, name: str, *, eradicate: bool = False) -> None: ...
     async def create_snapshot(self, volume: str, suffix: str | None = None) -> dict: ...
@@ -473,6 +475,65 @@ class PureFlashArrayClient:
                     return getattr(v, "name", None)
         return None
 
+    async def find_volume_by_vvol_id(self, vvol_id: str) -> dict | None:
+        """Resolve a vSphere vVol id to the FA volume backing it.
+
+        ``vvol_id`` is the value vCenter reports as
+        ``VirtualDisk.backing.backingObjectId`` — e.g.
+        ``"rfc4122.aabd56ec-c0d6-4af9-bd8e-70cab2058fa7"``. The Everpure VASA
+        provider records the same string on the backing volume as the
+        ``PURE_VVOL_ID`` tag in the ``vasa-integration.purestorage.com``
+        namespace, which makes this an exact lookup rather than a guess.
+
+        Returns ``{name, serial}`` for the live volume, or None when the id is
+        unknown to this array (normal — the vVol may live on a different array).
+
+        Two things this deliberately does NOT do:
+
+        * It never infers anything from the volume *name*. vVol volumes follow
+          ``vvol-<vm>-<hex>-vg/Data-<hex>`` by default but operators can rename
+          them, so the name carries no guarantees.
+        * It never matches on size. A VM commonly has several same-size disks,
+          so size is ambiguous where ``PURE_VVOL_ID`` is unique.
+
+        The tags query MUST pass ``namespaces``: an unnamespaced
+        ``get_volumes_tags`` returns only user-authored tags and makes it look
+        as though the VASA mapping does not exist.
+
+        The match is pushed server-side via ``filter``. That matters for
+        correctness, not just speed: the namespace holds thousands of entries on
+        a busy array (2672 on one lab array), and paging all of them clientside
+        risks a truncated page silently reporting "unresolved". Filtering on
+        ``key`` as well as ``value`` is deliberate — ``PURE_VVOL_ID2`` carries
+        the same value, so a value-only filter returns duplicate rows.
+        """
+        want = (vvol_id or "").strip()
+        if not want or not _VVOL_ID_RE.fullmatch(want):
+            # vVol ids are always "rfc4122.<uuid>". Anything else cannot match,
+            # and refusing it early keeps caller-supplied text out of the
+            # filter expression below.
+            return None
+        flt = f"key='{VVOL_ID_TAG}' and value='{want}'"
+        tags = await self._call(lambda c: c.get_volumes_tags(
+            namespaces=[VASA_TAG_NAMESPACE], filter=flt))
+        for tag in tags or []:
+            if getattr(tag, "key", None) != VVOL_ID_TAG:
+                continue
+            if (getattr(tag, "value", "") or "").strip() != want:
+                continue
+            resource = getattr(tag, "resource", None)
+            name = getattr(resource, "name", None) if resource else None
+            if not name:
+                continue
+            vol = await self.get_volume(name)
+            # A tag can outlive its volume (destroyed but not yet eradicated);
+            # treat that as "not resolvable here" rather than returning a
+            # volume the caller cannot attach.
+            if vol is None or vol.get("destroyed"):
+                return None
+            return {"name": vol["name"], "serial": vol.get("serial")}
+        return None
+
     async def extend_volume(self, name, size) -> dict:
         from pypureclient.flasharray import VolumePatch
 
@@ -704,6 +765,9 @@ class MockFlashArrayClient:
         self.protection_groups: dict[str, dict] = {}
         self.filesystems: dict[str, dict] = {}
         self.nfs_exports: dict[str, dict] = {}
+        # vVol id ("rfc4122.<uuid>") -> volume name, standing in for the
+        # PURE_VVOL_ID tags the VASA provider writes on a real array.
+        self.vvol_ids: dict[str, str] = {}
         self.calls: list[tuple[str, dict]] = []
 
     def _rec(self, op: str, **kw: Any) -> None:
@@ -874,6 +938,22 @@ class MockFlashArrayClient:
             if (v.get("serial") or "").lower() == want:
                 return name
         return None
+
+    async def find_volume_by_vvol_id(self, vvol_id):
+        """Mock vVol resolution, backed by the ``vvol_ids`` map.
+
+        Tests seed ``client.vvol_ids["rfc4122.<uuid>"] = "<volume name>"`` to
+        stand in for the ``PURE_VVOL_ID`` tags the VASA provider writes.
+        """
+        self._rec("find_volume_by_vvol_id", vvol_id=vvol_id)
+        want = (vvol_id or "").strip()
+        name = self.vvol_ids.get(want) if want else None
+        if not name:
+            return None
+        vol = await self.get_volume(name)
+        if vol is None:
+            return None
+        return {"name": vol["name"], "serial": vol.get("serial")}
 
     async def extend_volume(self, name, size):
         self.volumes.setdefault(name, {})["size"] = size
@@ -1089,6 +1169,18 @@ def _norm_wwn(wwn: str) -> str:
 # EFI-vars disk, ~528 KiB); create_volume floors to this so every connector that
 # provisions through this client inherits the guard.
 FA_MIN_VOLUME_BYTES = 1048576
+
+# Tag namespace the Everpure VASA provider writes vVol metadata into, and the
+# key within it holding the vCenter vVol id (``rfc4122.<uuid>``, the same string
+# vCenter reports as VirtualDisk.backing.backingObjectId). This pairing is the
+# authoritative vVol -> FA volume mapping; see find_volume_by_vvol_id.
+VASA_TAG_NAMESPACE = "vasa-integration.purestorage.com"
+VVOL_ID_TAG = "PURE_VVOL_ID"
+
+# vCenter always reports a vVol id as "rfc4122.<uuid>". Validated before the
+# value is interpolated into a tag filter expression.
+_VVOL_ID_RE = re.compile(r"rfc4122\.[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}"
+                         r"-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}")
 
 
 def _to_bytes(size: str | int) -> int:

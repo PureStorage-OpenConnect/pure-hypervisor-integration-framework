@@ -17,7 +17,10 @@ Wraps the Everpure Data VMware integration:
   as a *Storage Provider* to enable Virtual Volumes (vVols). The provider
   endpoint is `https://<array>:8084` and requires FlashArray admin credentials.
   Real arrays expose two controllers (CT0/CT1); register both for HA.
-- **Datastores** — VMFS (FlashArray volume backed), NFS, and vVol.
+- **Datastores** — VMFS (FlashArray volume backed) and NFS. vVol datastore
+  *provisioning* is not implemented (vVols are deprecated); create the vVol
+  datastore in vCenter. Migrating VMs on or off an existing vVol datastore is
+  fully supported — see [vVol disk resolution](#vvol-disk-resolution).
 
 ## Connection (target_schema)
 
@@ -48,7 +51,7 @@ a FlashArray is associated, confirms `ctx.array.info()`. Mock-safe via
 | CONFIGURE | `configure` | (Re)register / refresh the VASA Storage Provider |
 | HOST_REGISTER | `register_hosts` | Create a FlashArray host group for the ESXi cluster; initiators are auto-discovered from vCenter (protocol-aware: iSCSI→IQN, FC→WWN, NVMe→NQN) unless typed explicitly (Ansible) |
 | CONNECTIVITY | `setup_connectivity` | Create per-host FlashArray hosts for iSCSI/FC/NVMe-oF and group them; initiators auto-discovered from vCenter when not supplied; FC triggers an HBA rescan; optional interface binding (iSCSI port binding / FC HBA / NVMe-oF adapter selection) |
-| PROVISION_DATASTORE | `provision_datastore` | Volume → connect to host group → rescan → create VMFS/vVol (iSCSI/FC/NVMe-oF); or NFS |
+| PROVISION_DATASTORE | `provision_datastore` | Volume → connect to host group → rescan → create VMFS (iSCSI/FC/NVMe-oF); or NFS. `type=vvol` is refused |
 | PROVISION_VOLUME | `provision` | Create a FlashArray volume (optionally connect to a host group) |
 | SNAPSHOT | `snapshot` | FlashArray volume snapshot |
 | CLONE | `clone` | FlashArray volume clone (optionally attach to host group) |
@@ -115,7 +118,7 @@ deploy flow below.
    (IQN/WWN/NQN) are **auto-discovered from vCenter** — the operator no longer types
    them. The array `create_host`/`create_host_group` calls are idempotent, so
    re-running registration safely converges.
-4. **Provision a datastore** (`provision_datastore`) — for VMFS/vVol the connector
+4. **Provision a datastore** (`provision_datastore`) — for VMFS the connector
    creates the FlashArray volume, connects it to the host group, triggers an ESXi
    storage rescan, then creates the datastore in vCenter. For NFS it registers the
    export with vCenter directly.
@@ -159,6 +162,49 @@ exercisable without a live vCenter. (Array iSCSI/NVMe *portal* discovery is not
 applicable to vSphere datastores and is intentionally not implemented; iSCSI
 port-binding / FC HBA / NVMe adapter discovery remains under the `nics` /
 `fc_hbas` / `nvme_sources` kinds.)
+
+## vVol disk resolution
+
+A vVol-backed VMDK has no device serial of its own, so it cannot be resolved the
+way an RDM is (`naa.624a9370<serial>` → FlashArray volume). Instead the
+connector uses the identity vCenter *does* expose and the mapping the Everpure
+VASA provider already maintains on the array:
+
+```
+VirtualDisk.backing.backingObjectId        "rfc4122.<uuid>"   (the vVol id)
+  → FlashArray volume tag PURE_VVOL_ID
+    in namespace vasa-integration.purestorage.com
+  → FlashArray volume name   (e.g. vvol-<vm>-<hex>-vg/Data-<hex>)
+  → volume serial            → scsi_wwid() / nvme_eui()
+```
+
+`capture_vm_spec` records `backingObjectId` for every vVol disk;
+`FlashArrayClient.find_volume_by_vvol_id` performs the lookup. From there a vVol
+disk follows the same migration path as an RDM.
+
+Implementation notes, each of which is load-bearing:
+
+- **The tag query must pass `namespaces`.** An unnamespaced `get_volumes_tags`
+  returns only user-authored tags, which makes it look as though no VASA
+  mapping exists at all.
+- **The match is filtered server-side** on *both* `key` and `value`. The
+  namespace holds thousands of entries on a busy array (2672 on one lab array),
+  so scanning client-side risks a truncated page silently reporting
+  "unresolved". Filtering on key as well as value matters because
+  `PURE_VVOL_ID2` carries the same value and would return duplicate rows.
+- **`PURE_VVOL_ID` is the only authoritative key.** Every other tag in the
+  namespace (`VMW_VVolName`, `VMW_VmID`, `VMW_VVolType`, …) collides across
+  volumes.
+- **Never infer from the volume name or size.** vVol volumes can be renamed,
+  and a VM commonly has several same-size disks, so neither is unique.
+- A vVol id is validated against `rfc4122.<uuid>` before use; anything else
+  short-circuits without reaching the array.
+- An id that resolves on **no** connected array is reported as unmappable
+  (usually the vVol lives on a different array) rather than guessed at.
+
+Verified against vCenter 9.1.0 and Purity//FA 6.12.1: 14 of 14 vVol disks
+resolved exactly, including a VM with three same-size 100 GiB and two same-size
+800 GiB data vVols that no size-based heuristic could disambiguate.
 
 ## FlashArray endpoint & token (from the associated array)
 
