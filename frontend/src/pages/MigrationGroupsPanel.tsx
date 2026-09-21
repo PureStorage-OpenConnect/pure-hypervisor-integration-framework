@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useState } from "react";
 import { api } from "../api/client";
 import { useMigrateConnectors } from "../hooks/useMigrateConnectors";
+import { validPlacements } from "../utils/placements";
 import type {
   Hypervisor, MigrationGroup, NetworkSummary, Placement, VmSpec, VmSummary,
 } from "../api/client";
@@ -140,7 +141,7 @@ export default function MigrationGroupsPanel({ hypervisors }: { hypervisors: Hyp
   const destIsVsphere = dest?.connector_key === "vsphere";
   const destChoices = eligible.filter((h) => h.id !== sourceId && source?.array_id && h.array_id);
   const clusterStorage = useMemo(
-    () => placements?.find((p) => p.cluster.id === destCluster)?.storage ?? [],
+    () => validPlacements(placements).find((p) => p.cluster.id === destCluster)?.storage ?? [],
     [placements, destCluster],
   );
   const placementReady = !placements || placements.length === 0 || (!!destCluster && !!destStorage);
@@ -161,7 +162,7 @@ export default function MigrationGroupsPanel({ hypervisors }: { hypervisors: Hyp
       const [ps, nets] = await Promise.all([api.listPlacements(id), api.listNetworks(id)]);
       setPlacements(ps); setDestNets(nets);
       if (ps.length === 1) {
-        setDestCluster(ps[0].cluster.id);
+        setDestCluster(validPlacements(ps)[0]?.cluster.id ?? "");
         if (ps[0].storage.length === 1) setDestStorage(ps[0].storage[0].id);
       }
     } catch (e) { setErr(String((e as Error).message)); }
@@ -279,7 +280,7 @@ export default function MigrationGroupsPanel({ hypervisors }: { hypervisors: Hyp
               <label>Cluster *</label>
               <select value={destCluster} onChange={(e) => { setDestCluster(e.target.value); setDestStorage(""); }}>
                 <option value="">Select…</option>
-                {placements.map((p) => <option key={p.cluster.id} value={p.cluster.id}>{p.cluster.name}</option>)}
+                {validPlacements(placements).map((p) => <option key={p.cluster.id} value={p.cluster.id}>{p.cluster.name}</option>)}
               </select>
             </div>
             <div style={{ flex: 1, minWidth: 240 }}>

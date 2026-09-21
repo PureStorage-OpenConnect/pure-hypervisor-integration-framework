@@ -6,6 +6,7 @@ import type {
 import { LiveLog, useAsync } from "../components";
 import MigrationGroupsPanel from "./MigrationGroupsPanel";
 import { useMigrateConnectors } from "../hooks/useMigrateConnectors";
+import { validPlacements } from "../utils/placements";
 
 // Cross-hypervisor VM migration (cold/reboot cutover). The same FlashArray
 // volume(s) are re-pointed from the source to the destination — no data moves.
@@ -143,7 +144,7 @@ export default function MigrationPage() {
       const ps = await api.listPlacements(id);
       setPlacements(ps);
       if (ps.length === 1) {
-        setDestCluster(ps[0].cluster.id);
+        setDestCluster(validPlacements(ps)[0]?.cluster.id ?? "");
         if (ps[0].storage.length === 1) setDestStorage(ps[0].storage[0].id);
       }
     } catch (e) {
@@ -152,7 +153,7 @@ export default function MigrationPage() {
   };
 
   const clusterStorage = useMemo(
-    () => placements?.find((p) => p.cluster.id === destCluster)?.storage ?? [],
+    () => validPlacements(placements).find((p) => p.cluster.id === destCluster)?.storage ?? [],
     [placements, destCluster],
   );
   // Placement is required only when the destination exposes Everpure-connected clusters.

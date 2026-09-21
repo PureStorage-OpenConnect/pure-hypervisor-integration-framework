@@ -653,3 +653,49 @@ async def test_move_still_eradicates_source_volumes_on_clean_removal():
     assert "delete:src-1:keep=True" in src.events
     erased = [kw.get("name") for op, kw in array.calls if op == "delete_volume"]
     assert set(erased) >= {"vol-a", "vol-b"}
+
+
+from phif.connectors.registry import discover as _discover_connectors  # noqa: E402
+
+# 'example' is the reference connector; 'fake' is this module's own test double,
+# which auto-discovery also picks up because it subclasses HypervisorConnector.
+_REAL_CONNECTOR_KEYS = sorted(
+    k for k in _discover_connectors() if k not in ("example", "fake"))
+
+
+# --------------------------------------------------------------------------- #
+# list_placements shape — enforced for EVERY connector
+#
+# The migration wizard reads placement.cluster.id. The Nutanix connector
+# returned a flat {"id","name","kind"} list, so selecting it as a destination
+# crashed the whole page with "Cannot read properties of undefined (reading
+# 'id')". Nothing caught it because no test asserted the nested shape.
+# --------------------------------------------------------------------------- #
+@pytest.mark.parametrize("connector_key", _REAL_CONNECTOR_KEYS)
+async def test_list_placements_matches_the_wizard_contract(connector_key, make_context):
+    from phif.connectors.registry import get_connector_class
+
+    cls = get_connector_class(connector_key)
+    ctx = make_context(
+        connector_key=connector_key,
+        connection={"host": "mgr.test", "vcenter_host": "vc.test",
+                    "node_host": "pve.test", "pool_master_host": "xcp.test",
+                    "pc_host": "pc.test", "pc_user": "admin",
+                    "api_url": "https://vme.test", "kubeconfig": "apiVersion: v1"},
+        secrets={"password": "p", "ssh_password": "p", "vcenter_password": "p",
+                 "pc_password": "p", "api_token": "t"},
+    )
+    placements = await cls(ctx).list_placements()
+
+    assert isinstance(placements, list), f"{connector_key}: not a list"
+    for p in placements:
+        assert isinstance(p, dict), f"{connector_key}: entry is not a dict: {p!r}"
+        # The exact access the wizard performs.
+        assert "cluster" in p, f"{connector_key}: entry has no 'cluster' key: {p!r}"
+        assert isinstance(p["cluster"], dict), f"{connector_key}: cluster not a dict"
+        assert p["cluster"].get("id"), f"{connector_key}: cluster.id missing/empty"
+        assert p["cluster"].get("name"), f"{connector_key}: cluster.name missing/empty"
+        assert isinstance(p.get("storage"), list), f"{connector_key}: storage not a list"
+        for s in p["storage"]:
+            assert s.get("id"), f"{connector_key}: storage entry has no id: {s!r}"
+            assert s.get("name"), f"{connector_key}: storage entry has no name: {s!r}"

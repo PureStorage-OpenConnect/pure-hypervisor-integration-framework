@@ -543,11 +543,69 @@ class NutanixConnector(HypervisorConnector):
                 for s in await self._api_list("/api/networking/v4.0/config/subnets")]
 
     async def list_placements(self) -> list[dict[str, Any]]:
-        """Storage containers are the placement target for a new VM's disks."""
+        """Clusters with their FlashArray-backed storage containers.
+
+        Must return the base contract's nested shape —
+        ``[{"cluster": {"id","name"}, "storage": [{"id","name","kind"}]}]`` —
+        because the migration wizard reads ``placement.cluster.id``. Returning a
+        flat ``{"id","name","kind"}`` list crashed the wizard with
+        "Cannot read properties of undefined (reading 'id')" the moment a
+        Nutanix destination was selected.
+
+        Only FlashArray-backed containers are listed, and only clusters that
+        have at least one, so the operator cannot land a migrated VM on Nutanix
+        native storage (ADSF) where there would be no array volume to overwrite.
+        A container is FlashArray-backed when its name matches an
+        ``external_storage`` entity whose vendor is ``kPureStorage`` — the
+        container entity itself reports no provider.
+        """
         if self._mock_or_dry():
-            return [{"id": "mock-container", "name": "FA-container", "kind": "container"}]
-        return [{"id": c["entity_id"], "name": c["name"], "kind": "container"}
-                for c in await self._storage_containers()]
+            return [{"cluster": {"id": "mock-cluster", "name": "mock-cluster"},
+                     "storage": [{"id": "mock-container", "name": "FA-container",
+                                  "kind": "container"}]}]
+
+        fa_names = {e["name"] for e in await self._fa_external_storage()
+                    if e.get("name")}
+        if not fa_names:
+            # No FlashArray external storage registered: nothing safe to land on.
+            return []
+
+        cluster_ids = await self._cluster_ext_ids_by_name()
+        grouped: dict[str, list[dict[str, Any]]] = {}
+        for c in await self._storage_containers():
+            if c["name"] not in fa_names:
+                continue
+            grouped.setdefault(c.get("cluster") or "", []).append(
+                {"id": c["entity_id"], "name": c["name"], "kind": "container"})
+
+        out: list[dict[str, Any]] = []
+        for cluster_name, storage in sorted(grouped.items()):
+            out.append({
+                "cluster": {"id": cluster_ids.get(cluster_name) or cluster_name,
+                            "name": cluster_name or "(unknown cluster)"},
+                "storage": storage,
+            })
+        return out
+
+    async def _cluster_ext_ids_by_name(self) -> dict[str, str]:
+        """Map AHV cluster name -> extId, skipping the Prism Central entry.
+
+        Prism Central appears in the cluster list with no hypervisor nodes; it is
+        not a placement target.
+        """
+        payload = await self._api("POST", "/api/nutanix/v3/clusters/list",
+                                  json_body={"kind": "cluster", "length": 50})
+        out: dict[str, str] = {}
+        for e in (payload or {}).get("entities") or []:
+            status = e.get("status") or {}
+            res = status.get("resources") or {}
+            if not ((res.get("nodes") or {}).get("hypervisor_server_list") or []):
+                continue
+            name = status.get("name")
+            ext_id = (e.get("metadata") or {}).get("uuid")
+            if name and ext_id:
+                out[name] = ext_id
+        return out
 
     async def _find_vm(self, vm_ref: str) -> dict[str, Any]:
         """Fetch one VM by extId, recording its ETag for later in-place updates."""
