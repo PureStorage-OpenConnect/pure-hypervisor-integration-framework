@@ -581,17 +581,41 @@ class MigrationService:
         """Remove the source VM and delete + eradicate its FlashArray volumes.
         This is the last step, after the dest is confirmed running, so we are
         committed; cleanup failures are warnings, not migration failures. NOT added
-        to the rollback stack."""
+        to the rollback stack.
+
+        The source volumes are only eradicated once the source VM is confirmed
+        gone. Eradicating them while the VM still exists would strip the disks
+        out from under a live VM — see the guard below.
+        """
         await self._phase("finalize: remove source VM and delete source volume(s)")
         assert self.spec is not None
+        source_vm_removed = False
         try:
             r = await self.src.delete_vm(self.vm_ref, keep_disks=True)
+            source_vm_removed = bool(r.success)
             if not r.success:
                 await self.emit(
                     f"[move] WARNING: source VM removal failed: {r.message}")
         except Exception as exc:  # noqa: BLE001
             await self.emit(
                 f"[move] WARNING: source VM removal error: {type(exc).__name__}: {exc}")
+
+        if not source_vm_removed:
+            # The migration itself has succeeded — the destination is running off
+            # its own copies — so this is not a failure. But the source VM is
+            # still there and still owns these volumes, and eradication is
+            # irreversible, so leave them alone and tell the operator exactly
+            # what state things are in.
+            vols = [d.identity.fa_volume for d in self.spec.disks
+                    if d.identity.fa_volume]
+            await self.emit(
+                "[move] WARNING: NOT deleting the source volume(s) because the "
+                "source VM was not removed. The destination is running and is "
+                "safe to use; the source VM still exists and still owns "
+                f"{', '.join(vols) or 'its volumes'}. Remove the source VM "
+                "first, then delete those volumes by hand. (Eradicating them now "
+                "would take the disks away from a live VM.)")
+            return
 
         arr = self.src.ctx.array
         for disk in self.spec.disks:

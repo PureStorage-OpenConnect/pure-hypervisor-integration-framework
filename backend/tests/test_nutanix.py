@@ -319,15 +319,19 @@ def test_ahv_bus_is_unprefixed():
 # ---- destination: managed disk ----
 async def test_create_managed_disk_returns_the_fa_volume(make_context):
     """Nutanix creates the disk AND its array volume; the connector reads the
-    volume name back so the migration can overwrite it."""
+    volume name back so the migration can overwrite it.
+
+    The return must be a bare volume-name str, not an OpResult: the migration
+    engine passes it straight into copy_volume() as the copy target.
+    """
     created = _vm_payload([_disk(LEAF_VOL, index=2, disk_id="new-disk")])
     routes = {"/vms/vm-ext-1": (created, {"Etag": "e1"})}
     ctx = _ctx(make_context, routes)
     c = NutanixConnector(ctx)
 
-    r = await c.create_managed_disk("vm-ext-1", size_bytes=107374182400, order=2)
-    assert r.success
-    assert r.artifacts["fa_volume"] == LEAF_VOL
+    vol = await c.create_managed_disk("vm-ext-1", size_bytes=107374182400, order=2)
+    assert isinstance(vol, str), "must return the volume NAME per the base contract"
+    assert vol == LEAF_VOL
 
     post = [x for x in ctx.runner.calls
             if x["method"] == "POST" and x["url"].endswith("/disks")][0]
@@ -345,9 +349,11 @@ async def test_create_managed_disk_fails_on_non_fa_container(make_context):
     routes = {"/vms/vm-ext-1": (created, {})}
     c = NutanixConnector(_ctx(make_context, routes))
 
-    r = await c.create_managed_disk("vm-ext-1", size_bytes=1024, order=0)
-    assert not r.success
-    assert "not FlashArray-backed" in r.message
+    from phif.connectors.base import ConnectorError
+
+    with pytest.raises(ConnectorError) as e:
+        await c.create_managed_disk("vm-ext-1", size_bytes=1024, order=0)
+    assert "not FlashArray-backed" in str(e.value)
 
 
 # ---- destructive guard ----
@@ -435,7 +441,8 @@ async def test_create_vm_takes_id_from_task_not_from_post(make_context, monkeypa
     ctx = _ctx(make_context)
     ctx.runner = TaskRunner()
     c = NutanixConnector(ctx)
-    monkeypatch.setattr(c, "_cluster_ext_id", lambda: _async("cluster-ext-1"))
+    monkeypatch.setattr(c, "_cluster_ext_id",
+                        lambda **kw: _async("cluster-ext-1"))
 
     r = await c.create_vm(VmSpec(name="app-01", source_ref="s", vcpus=2,
                                  memory_bytes=2 * 1024**3))
@@ -460,7 +467,8 @@ async def test_create_vm_fails_when_task_names_no_vm(make_context, monkeypatch):
     ctx = _ctx(make_context)
     ctx.runner = TaskRunner(task_doc=_task(entities=()))
     c = NutanixConnector(ctx)
-    monkeypatch.setattr(c, "_cluster_ext_id", lambda: _async("cluster-ext-1"))
+    monkeypatch.setattr(c, "_cluster_ext_id",
+                        lambda **kw: _async("cluster-ext-1"))
 
     r = await c.create_vm(VmSpec(name="app-01", source_ref="s"))
     assert not r.success
@@ -528,8 +536,8 @@ async def test_create_managed_disk_awaits_before_reading_back(make_context):
         vm_doc=_vm_payload([_disk(LEAF_VOL, index=0, disk_id="new-disk")]))
     c = NutanixConnector(ctx)
 
-    r = await c.create_managed_disk("vm-ext-1", size_bytes=DISK_SIZE, order=0)
-    assert r.success
+    vol = await c.create_managed_disk("vm-ext-1", size_bytes=DISK_SIZE, order=0)
+    assert vol == LEAF_VOL
     urls = [x["url"] for x in ctx.runner.calls]
     post_i = next(i for i, u in enumerate(urls)
                   if u.endswith("/disks"))
@@ -539,3 +547,135 @@ async def test_create_managed_disk_awaits_before_reading_back(make_context):
 
 
 DISK_SIZE = 107374182400
+
+
+# --------------------------------------------------------------------------- #
+# Base-contract conformance
+#
+# The migration engine calls these positionally and uses their return values
+# directly, so a signature or return-type drift breaks Nutanix as a migration
+# destination without any unit test noticing.
+# --------------------------------------------------------------------------- #
+def test_vm_lifecycle_signatures_match_the_base_contract():
+    import inspect
+
+    from phif.connectors.base import HypervisorConnector as Base
+
+    for meth in ("create_vm", "create_managed_disk", "detach_volumes",
+                 "set_boot_order", "delete_vm", "stop_vm", "start_vm",
+                 "capture_vm_spec", "power_state"):
+        base_params = list(inspect.signature(getattr(Base, meth)).parameters)
+        mine = inspect.signature(getattr(NutanixConnector, meth)).parameters
+        # Every positional/keyword name the engine may pass must be accepted,
+        # either explicitly or via **kwargs.
+        takes_kwargs = any(p.kind is inspect.Parameter.VAR_KEYWORD
+                           for p in mine.values())
+        for name in base_params:
+            assert name in mine or takes_kwargs, (
+                f"{meth} does not accept {name!r} from the base contract")
+
+
+async def test_create_managed_disk_return_feeds_copy_volume(make_context, mock_array):
+    """End-to-end shape check at the seam the migration engine actually uses:
+        dest_vol = await dst.create_managed_disk(...)
+        await dst_arr.copy_volume(copy_src, dest_vol, overwrite=True)
+    A non-str return would sail through unit tests and fail on real hardware.
+    """
+    created = _vm_payload([_disk(LEAF_VOL, index=0, disk_id="new-disk")])
+    ctx = _ctx(make_context, {"/vms/vm-ext-1": (created, {"Etag": "e1"})})
+    c = NutanixConnector(ctx)
+
+    dest_vol = await c.create_managed_disk("vm-ext-1", size_bytes=DISK_SIZE,
+                                           order=0, boot=True)
+    mock_array.volumes["source-vol"] = {"size": DISK_SIZE, "serial": "SRC1"}
+    await mock_array.copy_volume("source-vol", dest_vol, overwrite=True)
+    assert ("copy_volume", {"source": "source-vol", "dest": dest_vol,
+                            "overwrite": True}) in mock_array.calls
+
+
+async def test_detach_volumes_accepts_diskspecs_and_matches_pod_scoped(make_context):
+    """The engine passes DiskSpec objects whose fa_volume is pod-scoped, while
+    Prism reports only the leaf -- matching must work across that."""
+    from phif.migrate.spec import DiskIdentity, DiskSpec
+
+    created = _vm_payload([_disk(LEAF_VOL, index=0, disk_id="d0")])
+    ctx = _ctx(make_context, {"/vms/vm-ext-1": (created, {"Etag": "e1"})})
+    ctx.runner = TaskRunner(vm_doc=created)
+    c = NutanixConnector(ctx)
+
+    r = await c.detach_volumes(
+        "vm-ext-1", [DiskSpec(DiskIdentity(fa_volume=SCOPED_VOL, serial="S1"))])
+    assert r.success
+    assert r.artifacts["detached"] == [LEAF_VOL]
+
+
+async def test_set_boot_order_accepts_diskspec_list(make_context):
+    from phif.migrate.spec import DiskIdentity, DiskSpec
+
+    c = NutanixConnector(_ctx(make_context))
+    disks = [DiskSpec(DiskIdentity(fa_volume="v0"), order=0, boot=True,
+                      source_ref="d0"),
+             DiskSpec(DiskIdentity(fa_volume="v1"), order=1, source_ref="d1")]
+    r = await c.set_boot_order("vm-ext-1", disks)
+    assert r.success
+    assert r.artifacts["boot_disk"] == "d0"
+
+
+async def test_create_vm_honours_wizard_placement(make_context, monkeypatch):
+    """`placement` is a dict from the migration wizard: cluster overrides the
+    connection's cluster, storage picks the container for the disks."""
+    from phif.migrate.spec import VmSpec
+
+    ctx = _ctx(make_context)
+    ctx.runner = TaskRunner()
+    c = NutanixConnector(ctx)
+    seen = {}
+
+    async def _fake_cluster(*, prefer=""):
+        seen["prefer"] = prefer
+        return "cluster-ext-9"
+
+    monkeypatch.setattr(c, "_cluster_ext_id", _fake_cluster)
+    r = await c.create_vm(VmSpec(name="app-01", source_ref="s"),
+                          placement={"cluster": "other-cluster",
+                                     "storage": "fa-container"})
+    assert r.success
+    assert seen["prefer"] == "other-cluster"
+    # Remembered for the create_managed_disk calls that follow.
+    assert c._placement_storage == "fa-container"
+
+
+async def test_delete_disconnects_before_destroying(make_context, mock_array):
+    """FlashArray refuses to destroy a connected volume (HTTP 400), and Nutanix
+    leaves a removed vDisk's volume connected to an individual stargate HOST
+    (not a host group) -- so a plain delete fails on exactly the volumes this is
+    meant to clean up."""
+    mock_array.volumes[SCOPED_VOL] = {"size": DISK_SIZE, "serial": "S1"}
+    mock_array.volume_connections[SCOPED_VOL] = [
+        {"host": "realm::nx-990-stargate-1", "host_group": None}]
+    c = NutanixConnector(_ctx(make_context))
+
+    r = await c.delete(LEAF_VOL)          # leaf name, as Prism reports it
+    assert r.success
+    assert r.artifacts["volume"] == SCOPED_VOL      # resolved to the pod-scoped name
+    assert r.artifacts["disconnected"] == ["realm::nx-990-stargate-1"]
+    ops = [op for op, _ in mock_array.calls]
+    assert ops.index("disconnect_volume") < ops.index("delete_volume")
+
+
+async def test_delete_prefers_host_group_when_present(make_context, mock_array):
+    mock_array.volumes[SCOPED_VOL] = {"size": DISK_SIZE, "serial": "S1"}
+    mock_array.volume_connections[SCOPED_VOL] = [
+        {"host": "h1", "host_group": "ntnx-hg"}]
+    c = NutanixConnector(_ctx(make_context))
+    r = await c.delete(SCOPED_VOL)
+    assert r.artifacts["disconnected"] == ["ntnx-hg"]
+
+
+async def test_delete_unconnected_volume_needs_no_disconnect(make_context, mock_array):
+    mock_array.volumes[SCOPED_VOL] = {"size": DISK_SIZE, "serial": "S1"}
+    c = NutanixConnector(_ctx(make_context))
+    r = await c.delete(SCOPED_VOL)
+    assert r.success
+    assert r.artifacts["disconnected"] == []
+    assert "disconnect_volume" not in [op for op, _ in mock_array.calls]

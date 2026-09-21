@@ -142,6 +142,10 @@ class NutanixConnector(HypervisorConnector):
     def __init__(self, ctx: ConnectorContext):
         super().__init__(ctx)
         self._etags: dict[str, str] = {}
+        # Storage container the migration wizard picked, if any. create_vm
+        # receives it via `placement` but create_managed_disk does not, so it is
+        # remembered here for the disk calls that follow.
+        self._placement_storage: str = ""
 
     # ------------------------------------------------------------- schema ---
     @classmethod
@@ -754,19 +758,26 @@ class NutanixConnector(HypervisorConnector):
         return OpResult.ok(f"VM {vm_ref} powered on")
 
     async def create_vm(self, spec: VmSpec, *, name: str = "",
-                        placement: str = "", network_map: Any = None,
-                        **_: Any) -> OpResult:
+                        placement: dict[str, Any] | None = None,
+                        network_map: Any = None, **_: Any) -> OpResult:
         """Create a shell VM with matching vCPU/RAM and no disks.
 
         Disks are added afterwards by :meth:`create_managed_disk`, one per source
         disk, so each gets its own FlashArray volume to be overwritten.
+
+        ``placement`` is the migration wizard's choice: ``cluster`` overrides the
+        connection's cluster for this run, and ``storage`` names the container
+        the disks should land in.
         """
         vm_name = name or spec.name
+        place = placement if isinstance(placement, dict) else {}
+        self._placement_storage = str(place.get("storage") or "")
         if self._mock_or_dry():
             return OpResult.ok(f"Dry-run: would create VM {vm_name}",
                                artifacts={"vm_ref": f"mock-{vm_name}"})
 
-        cluster_ext_id = await self._cluster_ext_id()
+        cluster_ext_id = await self._cluster_ext_id(
+            prefer=str(place.get("cluster") or ""))
         body: dict[str, Any] = {
             "name": vm_name,
             "numSockets": max(1, spec.vcpus),
@@ -815,8 +826,8 @@ class NutanixConnector(HypervisorConnector):
         return OpResult.ok(f"Created VM {vm_name}",
                            artifacts={"vm_ref": vm_ref, "name": vm_name})
 
-    async def _cluster_ext_id(self) -> str:
-        want = (self.ctx.target.get("cluster") or "").strip()
+    async def _cluster_ext_id(self, *, prefer: str = "") -> str:
+        want = (prefer or self.ctx.target.get("cluster") or "").strip()
         payload = await self._api("POST", "/api/nutanix/v3/clusters/list",
                                   json_body={"kind": "cluster", "length": 50})
         candidates = []
@@ -843,9 +854,14 @@ class NutanixConnector(HypervisorConnector):
         return candidates[0][1]
 
     async def create_managed_disk(self, vm_ref: str, *, size_bytes: int,
-                                  order: int = 0, bus: str = "scsi",
-                                  **_: Any) -> OpResult:
-        """Add a vDisk and return the FlashArray volume Nutanix provisioned.
+                                  order: int = 0, boot: bool = False,
+                                  bus: str = "scsi", **_: Any) -> str:
+        """Add a vDisk and return the NAME of the FlashArray volume behind it.
+
+        Returns a bare ``str`` (not an OpResult) because that is the contract in
+        :meth:`HypervisorConnector.create_managed_disk` — the migration engine
+        uses the return value directly as the copy target
+        (``copy_volume(copy_src, dest_vol, overwrite=True)``). Failures raise.
 
         This is the vendor-documented migration/clone pattern: Nutanix creates
         the disk object *and* its backing array volume, then the array volume is
@@ -863,14 +879,10 @@ class NutanixConnector(HypervisorConnector):
         normal sizes, but Nutanix applies a floor of
         ``NUTANIX_MIN_FA_VOLUME_BYTES`` (a 1 GiB request produced a 2 GiB
         volume; a 15 MiB vDisk also sat on a 2 GiB volume) and rounds some sizes
-        up slightly. The artifacts therefore report the volume's real size as
-        ``fa_size_bytes`` alongside the requested ``size_bytes``, so a caller
-        that must reconcile sizes can see both.
+        up slightly. The real size is logged when it differs from the request.
         """
         if self._mock_or_dry():
-            vol = f"mock-nx-{vm_ref}-{order}-dt"
-            return OpResult.ok(f"Dry-run: would create vDisk {order} ({size_bytes} B)",
-                               artifacts={"fa_volume": vol, "volume": vol})
+            return f"mock-nx-{vm_ref}-{order}-dt"
 
         container = await self._target_container(vm_ref)
         body = {
@@ -905,15 +917,13 @@ class NutanixConnector(HypervisorConnector):
                 continue
             volume = self._disk_volume_name(disk)
             if not volume:
-                return OpResult.fail(
+                raise ConnectorError(
                     f"vDisk index {order} was created on VM {vm_ref} but reports no "
                     f"external volume — the storage container {container!r} is not "
                     f"FlashArray-backed, so there is no array volume to migrate into.")
             await self.ctx.emit(f"[nutanix] vDisk {order} -> FA volume {volume}")
-            # Report the volume's real size next to the requested one: Nutanix
-            # floors small disks at NUTANIX_MIN_FA_VOLUME_BYTES and rounds some
-            # sizes up, so the two are not always equal.
-            fa_size = None
+            # Nutanix floors small disks at NUTANIX_MIN_FA_VOLUME_BYTES and rounds
+            # some sizes up, so surface the real size when it differs.
             if self.ctx.array is not None:
                 resolved = await self.ctx.array.resolve_volume_name(volume)
                 vol = await self.ctx.array.get_volume(resolved) if resolved else None
@@ -925,15 +935,8 @@ class NutanixConnector(HypervisorConnector):
                             f"[nutanix] note: requested {size_bytes} B but Nutanix "
                             f"provisioned a {fa_size} B volume (its own minimum / "
                             f"rounding); the volume is never smaller than the vDisk")
-            return OpResult.ok(
-                f"Created vDisk {order} backed by {volume}",
-                artifacts={"fa_volume": volume, "volume": volume,
-                           "disk_ext_id": (disk.get("backingInfo") or {})
-                           .get("diskExtId", ""),
-                           "size_bytes": int(size_bytes),
-                           "fa_size_bytes": int(fa_size) if fa_size else None},
-            )
-        return OpResult.fail(
+            return volume
+        raise ConnectorError(
             f"Created vDisk index {order} on VM {vm_ref} but could not find it when "
             f"reading the VM back")
 
@@ -956,7 +959,9 @@ class NutanixConnector(HypervisorConnector):
         disk on Nutanix-native storage would silently produce a VM with no FA
         volume to overwrite.
         """
-        if explicit := (self.ctx.target.get("storage_container") or "").strip():
+        # The migration wizard's pick wins over the connection default.
+        if explicit := (self._placement_storage
+                        or (self.ctx.target.get("storage_container") or "")).strip():
             for c in await self._storage_containers():
                 if explicit in (c["name"], c["entity_id"]):
                     return c["entity_id"]
@@ -977,18 +982,22 @@ class NutanixConnector(HypervisorConnector):
             f"Cannot choose a storage container for VM {vm_ref} (candidates: {names}). "
             f"Set 'storage_container' on the hypervisor connection.")
 
-    async def set_boot_order(self, vm_ref: str, boot_disk_ref: str = "",
+    async def set_boot_order(self, vm_ref: str, disks: Any = None,
                              **_: Any) -> OpResult:
         """AHV boots the lowest-indexed disk, so index 0 is the boot disk.
 
-        capture_vm_spec preserves each disk's index and create_managed_disk
-        recreates it, so the source's boot disk already lands at index 0 and
-        there is no separate boot-order object to set.
+        Takes ``disks`` (a list of DiskSpec) to match the base contract, which
+        the migration engine calls positionally. capture_vm_spec preserves each
+        disk's index and create_managed_disk recreates it, so the source's boot
+        disk already lands at index 0 and there is no separate boot-order object
+        to set.
         """
+        boot = next((getattr(d, "source_ref", "") for d in (disks or [])
+                     if getattr(d, "boot", False)), "")
         await self.ctx.emit(
             "[nutanix] boot order follows disk index; index 0 is the boot disk")
         return OpResult.ok("Boot order is implied by disk index on AHV",
-                           artifacts={"boot_disk": boot_disk_ref})
+                           artifacts={"boot_disk": boot})
 
     async def delete_vm(self, vm_ref: str, *, keep_disks: bool = True) -> OpResult:
         if self._mock_or_dry():
@@ -1024,18 +1033,37 @@ class NutanixConnector(HypervisorConnector):
         """No scratch objects are created on the Nutanix side."""
         return None
 
-    async def detach_volumes(self, vm_ref: str, volumes: Any = None,
+    async def detach_volumes(self, vm_ref: str, disks: Any = None,
                              **_: Any) -> OpResult:
-        """Detach vDisks whose backing FA volumes are in ``volumes``."""
-        wanted = {v.strip() for v in (volumes or []) if str(v).strip()}
+        """Remove the vDisks backed by ``disks`` from the VM.
+
+        ``disks`` is a list of DiskSpec (the base contract) or of plain volume
+        names. An empty list means every disk.
+
+        Note this is a **removal**, not a detach: AHV has no way to unhook a
+        vDisk and keep it, so the vDisk object goes away. The backing FlashArray
+        volume survives (observed live: still present and connected to a
+        stargate host well after the call), so the data is not destroyed — but
+        Nutanix no longer references it, and it will not be reclaimed
+        automatically. Callers are responsible for cleaning the volume up.
+        """
+        wanted: set[str] = set()
+        for d in (disks or []):
+            ident = getattr(d, "identity", None)
+            name = getattr(ident, "fa_volume", None) if ident is not None else d
+            if name and str(name).strip():
+                wanted.add(str(name).strip())
         if self._mock_or_dry():
             return OpResult.ok(f"Dry-run: would detach {len(wanted)} disk(s) "
                                f"from VM {vm_ref}")
+        # capture_vm_spec records the pod-scoped array name while Prism reports
+        # only the leaf, so match on the leaf segment at both ends.
+        wanted_leaves = {w.split("::")[-1] for w in wanted}
         vm = await self._find_vm(vm_ref)
         detached = []
         for disk in vm.get("disks") or []:
             volume = self._disk_volume_name(disk)
-            if wanted and volume not in wanted:
+            if wanted_leaves and volume.split("::")[-1] not in wanted_leaves:
                 continue
             disk_ext_id = (disk.get("backingInfo") or {}).get("diskExtId")
             if not disk_ext_id:
@@ -1104,10 +1132,36 @@ class NutanixConnector(HypervisorConnector):
 
     async def delete(self, volume: str, eradicate: bool = False,
                      **_: Any) -> OpResult:
+        """Destroy the FlashArray volume behind a vDisk.
+
+        Disconnects it first. Nutanix leaves a removed vDisk's volume connected
+        to an individual **stargate host** (not a host group), and FlashArray
+        refuses to destroy a connected volume with an HTTP 400 — so a plain
+        delete fails on exactly the volumes this is meant to clean up.
+        """
         if self.ctx.array is None:
             return OpResult.fail("No FlashArray associated with this hypervisor")
+        array = self.ctx.array
+        resolved = await array.resolve_volume_name(volume) or volume
         if self.ctx.dry_run:
-            return OpResult.ok(f"Dry-run: delete {volume} planned")
-        await self.ctx.array.delete_volume(volume, eradicate=eradicate)
-        return OpResult.ok(f"Deleted volume {volume}",
-                           artifacts={"volume": volume, "eradicated": eradicate})
+            return OpResult.ok(f"Dry-run: delete {resolved} planned")
+
+        disconnected = []
+        for conn in await array.list_volume_connections(resolved):
+            target = conn.get("host_group") or conn.get("host")
+            if not target:
+                continue
+            try:
+                await array.disconnect_volume(target, resolved)
+                disconnected.append(target)
+            except Exception as exc:  # noqa: BLE001
+                await self.ctx.emit(
+                    f"[nutanix] could not disconnect {resolved} from {target}: {exc}")
+        if disconnected:
+            await self.ctx.emit(
+                f"[nutanix] disconnected {resolved} from {', '.join(disconnected)}")
+
+        await array.delete_volume(resolved, eradicate=eradicate)
+        return OpResult.ok(f"Deleted volume {resolved}",
+                           artifacts={"volume": resolved, "eradicated": eradicate,
+                                      "disconnected": disconnected})

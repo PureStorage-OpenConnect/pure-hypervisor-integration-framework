@@ -591,3 +591,65 @@ async def test_dest_vm_name_kept_when_no_collision():
     res = await svc.run()
     assert res.success, res.message
     assert svc.spec.name == "db01"
+
+
+# --------------------------------------------------------------------------- #
+# _finalize_move: never eradicate source volumes behind a surviving source VM
+# --------------------------------------------------------------------------- #
+async def test_move_does_not_eradicate_source_volumes_if_source_vm_survives():
+    """A source that cannot delete its VM while keeping the disks (AHV cannot)
+    must not have its volumes eradicated -- that would strip the disks out from
+    under a live VM. The migration itself still succeeds: the destination is
+    running off its own copies.
+    """
+    array, src, dst = _build()
+    _make_real([src, dst])
+
+    async def _refuse(vm_ref, *, keep_disks=True):
+        src.events.append(f"delete:{vm_ref}:keep={keep_disks}")
+        return OpResult.fail("cannot delete the VM and keep its disks")
+
+    src.delete_vm = _refuse
+
+    res = await _svc(src, dst, mode="move").run()
+    assert res.success, res.message
+
+    # Removal was attempted...
+    assert "delete:src-1:keep=True" in src.events
+    # ...and because it failed, the source volumes were left completely alone.
+    assert not any(op == "delete_volume" and kw.get("name") in ("vol-a", "vol-b")
+                   for op, kw in array.calls)
+    assert not any(op == "disconnect_volume_from_group"
+                   and kw.get("volume") in ("vol-a", "vol-b")
+                   for op, kw in array.calls)
+    # The source volumes are still there.
+    assert "vol-a" in array.volumes and "vol-b" in array.volumes
+
+
+async def test_move_does_not_eradicate_source_volumes_if_removal_raises():
+    """Same guard when the source connector raises rather than returning fail."""
+    array, src, dst = _build()
+    _make_real([src, dst])
+
+    async def _boom(vm_ref, *, keep_disks=True):
+        raise RuntimeError("prism unreachable")
+
+    src.delete_vm = _boom
+
+    res = await _svc(src, dst, mode="move").run()
+    assert res.success, res.message
+    assert not any(op == "delete_volume" and kw.get("name") in ("vol-a", "vol-b")
+                   for op, kw in array.calls)
+    assert "vol-a" in array.volumes and "vol-b" in array.volumes
+
+
+async def test_move_still_eradicates_source_volumes_on_clean_removal():
+    """The guard must not change the normal path: a source VM that IS removed
+    still has its volumes disconnected and eradicated."""
+    array, src, dst = _build()
+    _make_real([src, dst])
+    res = await _svc(src, dst, mode="move").run()
+    assert res.success, res.message
+    assert "delete:src-1:keep=True" in src.events
+    erased = [kw.get("name") for op, kw in array.calls if op == "delete_volume"]
+    assert set(erased) >= {"vol-a", "vol-b"}

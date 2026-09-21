@@ -116,27 +116,36 @@ index is preserved from the source.
 vDisks and with them the backing FA volumes, so the request cannot be honoured
 and is not silently ignored.
 
-### ⚠️ Nutanix is not safe as a *move* migration source
+### A *move* source needs manual cleanup
 
-`MigrationRunner._finalize_move` calls
-`src.delete_vm(vm_ref, keep_disks=True)` and treats a failure as a **warning**,
-then unconditionally runs `delete_volume(vol, eradicate=True)` over the source
-disks. Because AHV cannot delete a VM while keeping its vDisks, this connector
-refuses that call — so a Nutanix *move* source ends in the worst possible state:
-**the source VM survives while its backing volumes are eradicated.**
+`_finalize_move` calls `src.delete_vm(vm_ref, keep_disks=True)`. AHV cannot
+delete a VM while keeping its vDisks, so this connector refuses that call.
 
-Until the migration service can handle a source that cannot preserve its disks,
-use Nutanix as a migration **destination**, or as a **copy** source
-(`_finalize_copy` leaves the source untouched). Do not run a *move* with Nutanix
-as the source.
+That used to be dangerous: the failure was only a warning and the finalize went
+on to `delete_volume(vol, eradicate=True)`, so the source VM survived while its
+volumes were eradicated. The migration service now **skips the volume deletion
+entirely unless the source VM was confirmed removed**, and logs exactly what is
+left behind.
+
+So a Nutanix *move* source is safe but incomplete: the destination runs off its
+own copies, and the source VM plus its volumes remain for the operator to remove.
+Nutanix as a **destination**, or as a **copy** source (`_finalize_copy` leaves
+the source untouched), is unaffected.
 
 ### Detaching a vDisk does not free its array volume
 
 Measured on AOS 7.6 / Purity 6.12.2: after `detach_volumes` removed a vDisk, the
 backing FlashArray volume stayed **live and still connected to a Nutanix
 stargate host** for at least 150 s, and was not reclaimed. `delete_vm` did not
-reclaim it either. Teardown and rollback paths should therefore expect to clean
-up FA volumes themselves rather than assume Nutanix releases them.
+reclaim it either. Teardown and rollback paths must therefore clean up FA
+volumes themselves rather than assume Nutanix releases them.
+
+Cleaning one up requires a **disconnect first**: FlashArray refuses to destroy a
+connected volume with an HTTP 400, and Nutanix connects each vDisk's volume to an
+individual *stargate host* rather than to a host group — so disconnecting only by
+host group leaves it attached. The `delete` action handles this (it resolves the
+pod-scoped name, disconnects from whatever host or host group holds the volume,
+then destroys it) via `FlashArrayClient.list_volume_connections`.
 
 ## API notes
 

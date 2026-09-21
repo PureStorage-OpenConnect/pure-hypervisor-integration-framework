@@ -57,6 +57,7 @@ class FlashArrayClient(Protocol):
     async def find_volume_name_by_serial(self, serial: str) -> str | None: ...
     async def find_volume_by_vvol_id(self, vvol_id: str) -> dict | None: ...
     async def resolve_volume_name(self, name: str) -> str | None: ...
+    async def list_volume_connections(self, volume: str) -> list[dict]: ...
     async def extend_volume(self, name: str, size: str | int) -> dict: ...
     async def delete_volume(self, name: str, *, eradicate: bool = False) -> None: ...
     async def create_snapshot(self, volume: str, suffix: str | None = None) -> dict: ...
@@ -578,6 +579,28 @@ class PureFlashArrayClient:
                 f"{len(live)} pod-scoped volumes ({names}). Cannot choose safely.")
         return getattr(live[0], "name", None)
 
+    async def list_volume_connections(self, volume: str) -> list[dict]:
+        """Return ``[{host, host_group}, ...]`` for everything ``volume`` is
+        connected to.
+
+        FlashArray refuses to destroy a connected volume (HTTP 400), so a
+        teardown has to disconnect first. Knowing the *host* matters as well as
+        the host group: Nutanix connects each vDisk's volume to an individual
+        stargate host rather than to a host group, so disconnecting only by
+        group leaves it attached.
+        """
+        want = (volume or "").strip()
+        if not want:
+            return []
+        items = await self._call(lambda c: c.get_connections(volume_names=[want]))
+        out = []
+        for conn in items or []:
+            host = getattr(conn, "host", None)
+            group = getattr(conn, "host_group", None)
+            out.append({"host": getattr(host, "name", None) if host else None,
+                        "host_group": getattr(group, "name", None) if group else None})
+        return out
+
     async def extend_volume(self, name, size) -> dict:
         from pypureclient.flasharray import VolumePatch
 
@@ -812,6 +835,8 @@ class MockFlashArrayClient:
         # vVol id ("rfc4122.<uuid>") -> volume name, standing in for the
         # PURE_VVOL_ID tags the VASA provider writes on a real array.
         self.vvol_ids: dict[str, str] = {}
+        # volume name -> [{host, host_group}, ...]
+        self.volume_connections: dict[str, list[dict]] = {}
         self.calls: list[tuple[str, dict]] = []
 
     def _rec(self, op: str, **kw: Any) -> None:
@@ -982,6 +1007,11 @@ class MockFlashArrayClient:
             if (v.get("serial") or "").lower() == want:
                 return name
         return None
+
+    async def list_volume_connections(self, volume):
+        """Mock connections, from the ``volume_connections`` map tests seed."""
+        self._rec("list_volume_connections", volume=volume)
+        return list(self.volume_connections.get((volume or "").strip(), []))
 
     async def resolve_volume_name(self, name):
         """Mock scoped-name resolution: exact match, then a ``::`` suffix match."""
