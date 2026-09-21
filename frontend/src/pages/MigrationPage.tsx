@@ -88,15 +88,21 @@ export default function MigrationPage() {
     return eligible.filter((h) => h.id !== sourceId && known.has(h.id));
   }, [eligible, sourceId, destVerdicts]);
 
-  // Refresh the eligibility verdicts whenever the source changes.
+  // Eligibility verdicts are fetched only once the DESTINATION step is showing.
+  // Fetching them on source selection made picking a source contact every
+  // candidate's FlashArray (~1s) before the operator had asked for any
+  // destination information at all.
   useEffect(() => {
-    if (!sourceId) { setDestVerdicts(null); return; }
+    if (step !== "destination" || !sourceId) return;
     let cancelled = false;
     api.migrationDestinations(sourceId)
       .then((r) => { if (!cancelled) setDestVerdicts(r.destinations); })
       .catch(() => { if (!cancelled) setDestVerdicts([]); });
     return () => { cancelled = true; };
-  }, [sourceId]);
+  }, [step, sourceId]);
+
+  // Changing the source invalidates any verdicts held for the previous one.
+  useEffect(() => { setDestVerdicts(null); }, [sourceId]);
 
   const loadVms = async (id: string) => {
     setBusy(true);

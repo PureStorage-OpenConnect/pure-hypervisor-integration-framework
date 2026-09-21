@@ -164,6 +164,38 @@ async def migration_destinations(source_hypervisor_id: str,
     source = await _get_hv(session, source_hypervisor_id)
     source_ok = _supports(source.connector_key, Capability.MIGRATE)
 
+    # Resolve the source array's replication connections ONCE, and each distinct
+    # destination array's name at most once. The first version called
+    # _array_connection_status per candidate, which rebuilt BOTH connectors and
+    # re-read the source array's connection list every time — 2N array round
+    # trips for N candidates, measured at ~1s for six hypervisors.
+    src_conns: list[dict[str, Any]] | None = None
+    dest_names: dict[str, str] = {}
+
+    async def _dest_array_name(hv: Hypervisor) -> str:
+        if hv.array_id in dest_names:
+            return dest_names[hv.array_id]
+        name = ""
+        try:
+            conn = await service.build_connector(session, hv, _noop)
+            if conn.ctx.array is not None:
+                name = await conn.ctx.array.array_name()
+        except Exception:  # noqa: BLE001 — unknown name, reported as unconnected
+            name = ""
+        dest_names[hv.array_id] = name
+        return name
+
+    async def _source_connections() -> list[dict[str, Any]]:
+        nonlocal src_conns
+        if src_conns is None:
+            try:
+                conn = await service.build_connector(session, source, _noop)
+                src_conns = (await conn.ctx.array.list_array_connections()
+                             if conn.ctx.array is not None else [])
+            except Exception:  # noqa: BLE001
+                src_conns = []
+        return src_conns
+
     out: list[dict[str, Any]] = []
     rows = (await session.execute(select(Hypervisor))).scalars().all()
     for hv in rows:
@@ -189,8 +221,13 @@ async def migration_destinations(source_hypervisor_id: str,
             entry["eligible"] = True
             entry["reason"] = "same FlashArray"
         else:
-            # Different arrays: only reachable over a replication connection.
-            connected, dest_name = await _array_connection_status(session, source, hv)
+            # Different arrays: only reachable over a REPLICATION connection
+            # (fleet-management cannot carry a volume).
+            dest_name = await _dest_array_name(hv)
+            connected = bool(dest_name) and any(
+                (c.get("name") or "") == dest_name
+                and _is_replication_connection(c.get("type"))
+                for c in await _source_connections())
             entry.update(cross_array=True, connection_exists=connected,
                          dest_array_name=dest_name,
                          needs_authorization=not connected)

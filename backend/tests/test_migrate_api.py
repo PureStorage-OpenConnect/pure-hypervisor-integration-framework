@@ -422,3 +422,67 @@ async def test_dry_run_is_threaded_into_runner_options(client, monkeypatch):
         "vm_ref": "101", "network_map": {}})
     assert r.status_code == 202, r.text
     assert not (seen.get("options") or {}).get("dry_run")
+
+
+async def test_destinations_reads_each_array_once(client, monkeypatch):
+    """Eligibility must not re-read the arrays per candidate.
+
+    The first version called _array_connection_status for every candidate, which
+    rebuilt both connectors and re-read the SOURCE array's connection list each
+    time — 2N array round trips for N candidates, ~1s for six hypervisors, and
+    it fired as soon as a source was picked.
+    """
+    from phif.flasharray.client import MockFlashArrayClient
+
+    counts = {"conns": 0, "names": 0}
+    orig_conns = MockFlashArrayClient.list_array_connections
+    orig_name = MockFlashArrayClient.array_name
+
+    async def _conns(self):
+        counts["conns"] += 1
+        return await orig_conns(self)
+
+    async def _name(self):
+        counts["names"] += 1
+        return await orig_name(self)
+
+    monkeypatch.setattr(MockFlashArrayClient, "list_array_connections", _conns)
+    monkeypatch.setattr(MockFlashArrayClient, "array_name", _name)
+    try:
+        a1 = await _mk_array(client, "10.0.10.1")
+        a2 = await _mk_array(client, "10.0.10.2")
+        src = await _make_hv(client, "proxmox", a1, "c1")
+        # Three candidates, TWO of them on the same destination array.
+        await _make_hv(client, "xcpng", a2, "c2")
+        await _make_hv(client, "hpevme", a2, "c3")
+        await _make_hv(client, "proxmox", a1, "c4")   # same array as the source
+
+        counts["conns"] = counts["names"] = 0
+        r = await client.get("/api/migrations/destinations",
+                             params={"source_hypervisor_id": src})
+        assert r.status_code == 200, r.text
+        dests = r.json()["destinations"]
+
+        # The source array's connection list is read at most ONCE for the whole
+        # request, however many candidates there are.
+        assert counts["conns"] <= 1, (
+            f"source connections read {counts['conns']} times; expected <= 1")
+
+        # Each DISTINCT destination array is named at most once — the invariant
+        # that matters. Asserted relative to the data (the suite shares a DB, so
+        # other tests' hypervisors appear as candidates too).
+        cross_arrays = {d["array_id"] for d in dests
+                        if d.get("cross_array") and d.get("array_id")}
+        cross_candidates = sum(1 for d in dests if d.get("cross_array"))
+        assert counts["names"] <= len(cross_arrays), (
+            f"array_name called {counts['names']} times for "
+            f"{len(cross_arrays)} distinct arrays")
+        if cross_candidates > len(cross_arrays):
+            # Proves the cache actually saved work rather than coincidentally
+            # matching: more candidates than arrays, yet no extra lookups.
+            assert counts["names"] < cross_candidates, (
+                f"{cross_candidates} cross-array candidates caused "
+                f"{counts['names']} array_name calls — not cached")
+    finally:
+        monkeypatch.setattr(MockFlashArrayClient, "list_array_connections", orig_conns)
+        monkeypatch.setattr(MockFlashArrayClient, "array_name", orig_name)
