@@ -255,6 +255,8 @@ down automatically after the conversion (and on rollback).
   copy-with-overwrite for *copy* mode) is performed — no host data movement.
 * Migrate live (hot) VMs — this is a cold cutover only.
 * Transfer UEFI NVRAM / efivars — a fresh efidisk is created on UEFI destinations.
+* Recreate CD-ROM / optical drives — the destination VM is built with **no optical
+  drive**, even when the source had one. See the known issue below.
 * Move non-Everpure disks — only FA-backed volumes (or vSphere VMFS/vVol/RDM disks) are supported.
 * Replication — source and destination must share the same physical array.
 
@@ -294,6 +296,27 @@ than hidden. Please read these before filing an issue.
   one physical array. There is no live migration and no cross-array path.
 * **UEFI NVRAM / efivars are not transferred** — a UEFI destination VM gets a
   fresh efidisk, so custom boot entries and Secure Boot enrolment are lost.
+* **CD-ROM / optical drives are not migrated — this affects every connector.**
+  `VmSpec`, the normalized model every migration passes through, has no field for
+  optical devices, and no connector's `capture_vm_spec` reads one. A source
+  CD-ROM is therefore dropped at *capture* time, before any destination is
+  involved, so the destination VM is built without an optical drive.
+
+  Two consequences worth planning for:
+
+  * **Installing guest tools by the platform's native method usually needs a
+    CD-ROM.** Nutanix Guest Tools, VMware Tools, XCP-ng/XenServer guest tools
+    and the virtio-win drivers are all normally delivered as an ISO. On a
+    migrated VM there is no drive to attach it to, so **add a CD-ROM drive to
+    the destination VM first**, then mount the ISO. (Package-manager installs —
+    `qemu-guest-agent` and similar — need no drive.)
+  * Device enumeration can shift. A guest that saw an optical device on the
+    source will not see one on the destination, which can renumber devices or
+    leave a stale fstab/boot entry referencing it.
+
+  The media itself would not be portable anyway: a drive backed by node-local
+  storage (e.g. Proxmox `local:iso/…`) has no equivalent on the destination, so
+  any future support would recreate an *empty* drive rather than carry the ISO.
 * **No authentication on the PHIF UI or API.** PHIF serves over TLS but has no
   user login, RBAC, or audit identity. Anyone who can reach the port can drive
   every operation, including destructive ones. Keep it on a management network.

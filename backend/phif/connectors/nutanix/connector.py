@@ -1123,19 +1123,25 @@ class NutanixConnector(HypervisorConnector):
         return OpResult.ok(f"Deleted VM {vm_ref} and its vDisks")
 
     # --------------------------------------------------------- migration ----
-    async def prepare_source_disks(self, spec: VmSpec, **_: Any) -> OpResult:
+    async def prepare_source_disks(self, spec: VmSpec,
+                                   options: dict[str, Any]) -> VmSpec:
         """Nothing to stage: a Nutanix vDisk is already its own FA volume.
 
         Unlike a VMFS-resident VMDK, there is no file to clone onto a new volume
         first — capture_vm_spec has already resolved every disk to the array
         volume that backs it.
+
+        Takes ``options`` positionally and returns the **VmSpec**, per
+        :meth:`HypervisorConnector.prepare_source_disks`. The migration engine
+        calls it as ``prepare_source_disks(spec, options)`` and then does
+        ``self.spec = updated``, so an OpResult return would replace the spec
+        with an OpResult and corrupt everything downstream.
         """
         volumes = [d.identity.fa_volume for d in spec.disks if d.identity.fa_volume]
         await self.ctx.emit(
             f"[nutanix] {len(volumes)} disk(s) already map 1:1 to FlashArray "
             f"volumes; no source staging needed")
-        return OpResult.ok("Source disks are FlashArray volumes already",
-                           artifacts={"volumes": volumes})
+        return spec
 
     async def cleanup_migration_scratch(self, spec: VmSpec) -> None:
         """No scratch objects are created on the Nutanix side."""

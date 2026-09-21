@@ -375,9 +375,9 @@ async def test_prepare_source_disks_is_a_noop(make_context, mock_array):
     spec = VmSpec(name="app-01", source_ref="vm-ext-1", disks=[
         DiskSpec(DiskIdentity(fa_volume=SCOPED_VOL, serial="ABC123"))])
     c = NutanixConnector(_ctx(make_context))
-    r = await c.prepare_source_disks(spec)
-    assert r.success
-    assert r.artifacts["volumes"] == [SCOPED_VOL]
+    # Called exactly as the engine does: positional options, returns the VmSpec.
+    out = await c.prepare_source_disks(spec, {})
+    assert out is spec, "must return the VmSpec, not an OpResult"
     # Nothing was provisioned or copied on the array.
     assert not any(op.startswith("create_volume") for op, _ in mock_array.calls)
 
@@ -556,23 +556,64 @@ DISK_SIZE = 107374182400
 # directly, so a signature or return-type drift breaks Nutanix as a migration
 # destination without any unit test noticing.
 # --------------------------------------------------------------------------- #
-def test_vm_lifecycle_signatures_match_the_base_contract():
+def test_connector_signatures_match_the_base_contract():
+    """Every overridden async method, on EVERY connector, must be callable the
+    way the engine calls it and return what the engine expects.
+
+    The engine invokes these POSITIONALLY and uses their return values
+    directly, so drift only shows up on real hardware. The first version of
+    this test accepted ``**kwargs`` as satisfying a positional parameter, which
+    let three bugs through:
+
+    * ``create_managed_disk`` returned an OpResult where the contract is a
+      volume-name ``str`` (the engine feeds it straight to ``copy_volume``).
+    * ``prepare_source_disks`` was ``(self, spec, **_) -> OpResult``, so the
+      engine's ``prepare_source_disks(spec, options)`` raised TypeError — and
+      its return replaces ``self.spec``, so an OpResult would have corrupted
+      the rest of the run.
+    * ``list_placements`` returned a flat list instead of
+      ``{cluster, storage}``, crashing the wizard.
+    """
     import inspect
 
     from phif.connectors.base import HypervisorConnector as Base
+    from phif.connectors.registry import discover
 
-    for meth in ("create_vm", "create_managed_disk", "detach_volumes",
-                 "set_boot_order", "delete_vm", "stop_vm", "start_vm",
-                 "capture_vm_spec", "power_state"):
-        base_params = list(inspect.signature(getattr(Base, meth)).parameters)
-        mine = inspect.signature(getattr(NutanixConnector, meth)).parameters
-        # Every positional/keyword name the engine may pass must be accepted,
-        # either explicitly or via **kwargs.
-        takes_kwargs = any(p.kind is inspect.Parameter.VAR_KEYWORD
-                           for p in mine.values())
-        for name in base_params:
-            assert name in mine or takes_kwargs, (
-                f"{meth} does not accept {name!r} from the base contract")
+    def positional(sig):
+        return [x.name for x in sig.parameters.values()
+                if x.kind in (x.POSITIONAL_ONLY, x.POSITIONAL_OR_KEYWORD)]
+
+    def norm(ann):
+        s = ann if isinstance(ann, str) else getattr(ann, "__name__", str(ann))
+        return s.replace("'", "").replace('"', "").strip()
+
+    methods = [m for m in dir(Base)
+               if not m.startswith("__")
+               and inspect.iscoroutinefunction(getattr(Base, m, None))]
+
+    problems = []
+    for key, cls in sorted(discover().items()):
+        if key in ("example", "fake"):
+            continue
+        for m in methods:
+            base_fn, own_fn = getattr(Base, m), getattr(cls, m, None)
+            if own_fn is None or own_fn is base_fn:
+                continue                        # not overridden
+            bs, osig = inspect.signature(base_fn), inspect.signature(own_fn)
+            takes_varargs = any(x.kind is x.VAR_POSITIONAL
+                                for x in osig.parameters.values())
+            missing = [n for n in positional(bs) if n not in positional(osig)]
+            if missing and not takes_varargs:
+                problems.append(
+                    f"{key}.{m} is not positionally callable: missing {missing}")
+            br, orr = bs.return_annotation, osig.return_annotation
+            if (br is not inspect.Signature.empty
+                    and orr is not inspect.Signature.empty
+                    and norm(br) != norm(orr)):
+                problems.append(
+                    f"{key}.{m} returns {norm(orr)}, contract says {norm(br)}")
+
+    assert not problems, "connector contract drift: " + "; ".join(problems)
 
 
 async def test_create_managed_disk_return_feeds_copy_volume(make_context, mock_array):
