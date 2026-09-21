@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
 import { api } from "../api/client";
+import { useMigrateConnectors } from "../hooks/useMigrateConnectors";
 import type {
   Hypervisor, MigrationGroup, NetworkSummary, Placement, VmSpec, VmSummary,
 } from "../api/client";
@@ -8,8 +9,6 @@ import type {
 // hypervisor to one destination (same FlashArray) with a shared network map and
 // options, run together up to `concurrency` at once — now or at a scheduled time.
 // The single-VM wizard lives in MigrationPage; this panel is the multi-VM path.
-
-const MIGRATE_CONNECTORS = new Set(["proxmox", "xcpng", "hpevme", "vsphere", "openstack", "openshift"]);
 
 function statusClass(s: string): string {
   if (s === "succeeded") return "ga";
@@ -129,9 +128,12 @@ export default function MigrationGroupsPanel({ hypervisors }: { hypervisors: Hyp
   const [err, setErr] = useState<string | null>(null);
   const [msg, setMsg] = useState<string | null>(null);
 
+  // Migration-capable connectors come from the backend descriptors
+  // (Capability.MIGRATE), never a list hardcoded in the UI.
+  const { filterMigratable } = useMigrateConnectors();
   const eligible = useMemo(
-    () => hypervisors.filter((h) => MIGRATE_CONNECTORS.has(h.connector_key)),
-    [hypervisors],
+    () => filterMigratable(hypervisors),
+    [hypervisors, filterMigratable],
   );
   const source = eligible.find((h) => h.id === sourceId);
   const dest = eligible.find((h) => h.id === destId);

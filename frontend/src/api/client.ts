@@ -28,6 +28,19 @@ export interface ActionSpec {
   long_running: boolean;
 }
 
+export interface MigrationDestination {
+  id: string;
+  name: string;
+  connector_key: string;
+  array_id: string | null;
+  eligible: boolean;
+  reason: string;
+  cross_array: boolean;
+  connection_exists: boolean;
+  needs_authorization: boolean;
+  dest_array_name: string;
+}
+
 export interface ConnectorDescriptor {
   key: string;
   name: string;
@@ -375,6 +388,15 @@ export const api = {
     req<{ migration_id: string; job_id: string }>("POST", "/migrations", b),
   listMigrations: () => req<Migration[]>("GET", "/migrations"),
   getMigration: (id: string) => req<Migration>("GET", `/migrations/${id}`),
+  // Pairwise migration eligibility for every candidate destination: same array,
+  // or a replication connection between the two arrays. Ineligible candidates
+  // come back with a reason so the UI can explain rather than hide them.
+  migrationDestinations: (sourceId: string) =>
+    req<{
+      source_hypervisor_id: string;
+      source_supports_migrate: boolean;
+      destinations: MigrationDestination[];
+    }>("GET", `/migrations/destinations?source_hypervisor_id=${sourceId}`),
   migrationPrecheck: (sourceId: string, destId: string) =>
     req<{ cross_array: boolean; connection_exists: boolean; dest_array_name: string; needs_authorization: boolean }>(
       "GET",

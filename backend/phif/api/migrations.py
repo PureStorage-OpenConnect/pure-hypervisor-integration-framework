@@ -9,6 +9,7 @@ job via :func:`phif.migrate.service.run_migration`.
 from __future__ import annotations
 
 from datetime import datetime, timezone
+from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy import select
@@ -47,9 +48,26 @@ def _supports(connector_key: str, capability: Capability) -> bool:
     return cls is not None and cls.supports(capability)
 
 
+def _is_replication_connection(conn_type: str | None) -> bool:
+    """True only for a connection that can actually move volume data.
+
+    FlashArray array-connections come in several types and a single pair of
+    arrays often has more than one. ``async-replication`` and
+    ``sync-replication`` can carry a volume; **``fleet-management`` cannot** —
+    it only federates management. Matching on the remote array's NAME alone
+    therefore produces false positives: observed live, an array had
+    ``Solutions-Engineering-Fleet-<remote>`` (fleet-management) whose
+    ``remote.name`` equals the remote array, which made an unreplicated pair
+    look migration-ready and would have failed only once the volume transfer
+    was attempted.
+    """
+    t = (conn_type or "").strip().lower()
+    return "replication" in t
+
+
 async def _array_connection_status(session, source, dest):
     """Return (connected, dest_array_name): whether the SOURCE array already has a
-    replication connection to the DESTINATION array."""
+    **replication** connection to the DESTINATION array."""
     try:
         src_conn = await service.build_connector(session, source, _noop)
         dst_conn = await service.build_connector(session, dest, _noop)
@@ -57,7 +75,9 @@ async def _array_connection_status(session, source, dest):
             return False, ""
         dest_name = await dst_conn.ctx.array.array_name()
         conns = await src_conn.ctx.array.list_array_connections()
-        return any((c.get("name") or "") == dest_name for c in conns), dest_name
+        return any((c.get("name") or "") == dest_name
+                   and _is_replication_connection(c.get("type"))
+                   for c in conns), dest_name
     except Exception:  # noqa: BLE001 — surface as "not connected / unknown"
         return False, ""
 
@@ -125,6 +145,68 @@ async def list_placements(hv_id: str, session: AsyncSession = Depends(get_sessio
         return await connector.list_placements()
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(400, f"Listing placements failed: {exc}") from exc
+
+
+@router.get("/migrations/destinations")
+async def migration_destinations(source_hypervisor_id: str,
+                                 session: AsyncSession = Depends(get_session)):
+    """Every hypervisor judged as a migration destination for this source.
+
+    Answers, for each candidate, the question the submit path enforces: can a
+    volume actually reach it? That means **the same FlashArray**, or a
+    **replication connection** between the two arrays.
+
+    Ineligible candidates are returned too, each with a ``reason``, so the UI can
+    show them greyed out and explain why instead of silently omitting them — a
+    hidden candidate looks like a configuration fault and sends people hunting
+    through array and host-group settings for a problem that isn't there.
+    """
+    source = await _get_hv(session, source_hypervisor_id)
+    source_ok = _supports(source.connector_key, Capability.MIGRATE)
+
+    out: list[dict[str, Any]] = []
+    rows = (await session.execute(select(Hypervisor))).scalars().all()
+    for hv in rows:
+        if hv.id == source.id:
+            continue
+
+        entry: dict[str, Any] = {
+            "id": hv.id, "name": hv.name, "connector_key": hv.connector_key,
+            "array_id": hv.array_id, "eligible": False, "reason": "",
+            "cross_array": False, "connection_exists": False,
+            "needs_authorization": False, "dest_array_name": "",
+        }
+        if not _supports(hv.connector_key, Capability.MIGRATE):
+            entry["reason"] = (f"{hv.connector_key} cannot act as a migration "
+                               f"destination")
+        elif not source_ok:
+            entry["reason"] = (f"{source.connector_key} cannot act as a migration "
+                               f"source")
+        elif not source.array_id or not hv.array_id:
+            which = "source" if not source.array_id else "destination"
+            entry["reason"] = f"the {which} has no FlashArray associated"
+        elif source.array_id == hv.array_id:
+            entry["eligible"] = True
+            entry["reason"] = "same FlashArray"
+        else:
+            # Different arrays: only reachable over a replication connection.
+            connected, dest_name = await _array_connection_status(session, source, hv)
+            entry.update(cross_array=True, connection_exists=connected,
+                         dest_array_name=dest_name,
+                         needs_authorization=not connected)
+            # Still offered when unconnected: the migration can configure the
+            # connection, but only with explicit authorization at submit time.
+            entry["eligible"] = True
+            entry["reason"] = (
+                f"replication connection to {dest_name or 'the destination array'}"
+                if connected else
+                f"different FlashArrays — a replication connection to "
+                f"{dest_name or 'the destination array'} must be authorized")
+        out.append(entry)
+
+    return {"source_hypervisor_id": source.id,
+            "source_supports_migrate": source_ok,
+            "destinations": out}
 
 
 @router.get("/migrations/precheck")

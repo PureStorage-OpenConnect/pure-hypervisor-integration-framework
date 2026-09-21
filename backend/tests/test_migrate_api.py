@@ -158,3 +158,218 @@ async def test_duplicate_in_progress_rejected(client, monkeypatch):
         "source_hypervisor_id": src, "dest_hypervisor_id": dst,
         "vm_ref": "100", "network_map": {"vmbr0": "net-uuid-0"}})
     assert r.status_code == 409
+
+
+# --------------------------------------------------------------------------- #
+# /api/migrations/destinations — pairwise eligibility
+#
+# The submit path rejects an unreachable pair with a 409, but only after the
+# operator has picked one. This endpoint judges every candidate up front against
+# the same rule: same FlashArray, or a replication connection between them.
+# --------------------------------------------------------------------------- #
+async def _mk_array(client, ep):
+    r = await client.post("/api/arrays", json={
+        "name": _uniq("fa"), "mgmt_endpoint": ep, "api_token": "t"})
+    assert r.status_code == 201, r.text
+    return r.json()["id"]
+
+
+def _by_id(payload, hv_id):
+    return next(d for d in payload["destinations"] if d["id"] == hv_id)
+
+
+async def test_destinations_same_array_is_eligible(client):
+    a1 = await _mk_array(client, "10.0.1.1")
+    src = await _make_hv(client, "proxmox", a1, "d1")
+    dst = await _make_hv(client, "xcpng", a1, "d2")
+
+    r = await client.get("/api/migrations/destinations",
+                         params={"source_hypervisor_id": src})
+    assert r.status_code == 200, r.text
+    payload = r.json()
+    assert payload["source_supports_migrate"] is True
+    entry = _by_id(payload, dst)
+    assert entry["eligible"] is True
+    assert entry["cross_array"] is False
+    assert entry["needs_authorization"] is False
+    assert "same flasharray" in entry["reason"].lower()
+
+
+async def test_destinations_cross_array_flags_authorization(client):
+    a1 = await _mk_array(client, "10.0.2.1")
+    a2 = await _mk_array(client, "10.0.2.2")
+    src = await _make_hv(client, "proxmox", a1, "d3")
+    dst = await _make_hv(client, "xcpng", a2, "d4")
+
+    r = await client.get("/api/migrations/destinations",
+                         params={"source_hypervisor_id": src})
+    entry = _by_id(r.json(), dst)
+    # Still offered -- the migration CAN build the connection, but only with
+    # explicit authorization, which the reason has to make clear.
+    assert entry["eligible"] is True
+    assert entry["cross_array"] is True
+    assert entry["needs_authorization"] is True
+    assert "replication connection" in entry["reason"].lower()
+
+
+async def test_destinations_without_an_array_are_ineligible(client):
+    a1 = await _mk_array(client, "10.0.3.1")
+    src = await _make_hv(client, "proxmox", a1, "d5")
+    # A hypervisor with no FlashArray cannot receive a volume at all.
+    r = await client.post("/api/hypervisors", json={
+        "name": _uniq("hv-noarray"), "connector_key": "xcpng",
+        "connection": dict(_CONN["xcpng"], host_group="hg"),
+        "secrets": {"ssh_password": "p", "password": "p", "api_token": "tok"}})
+    assert r.status_code == 201, r.text
+    dst = r.json()["id"]
+
+    entry = _by_id((await client.get(
+        "/api/migrations/destinations",
+        params={"source_hypervisor_id": src})).json(), dst)
+    assert entry["eligible"] is False
+    assert "no flasharray" in entry["reason"].lower()
+
+
+async def test_destinations_excludes_the_source_itself(client):
+    a1 = await _mk_array(client, "10.0.4.1")
+    src = await _make_hv(client, "proxmox", a1, "d6")
+    payload = (await client.get("/api/migrations/destinations",
+                                params={"source_hypervisor_id": src})).json()
+    assert all(d["id"] != src for d in payload["destinations"])
+
+
+async def test_destinations_rejects_non_migrate_connector(client):
+    """A connector without Capability.MIGRATE is reported ineligible with a
+    reason, not hidden -- hiding it is what made the Nutanix connector look
+    like a misconfiguration."""
+    a1 = await _mk_array(client, "10.0.5.1")
+    src = await _make_hv(client, "proxmox", a1, "d7")
+    # 'openshift' has MIGRATE; 'example' does not -- use it as the negative case.
+    r = await client.post("/api/hypervisors", json={
+        "name": _uniq("hv-example"), "connector_key": "example",
+        "connection": {"host": "mgr.test", "username": "admin"},
+        "secrets": {"password": "p"}, "array_id": a1})
+    assert r.status_code == 201, r.text
+    dst = r.json()["id"]
+
+    entry = _by_id((await client.get(
+        "/api/migrations/destinations",
+        params={"source_hypervisor_id": src})).json(), dst)
+    assert entry["eligible"] is False
+    assert "cannot act as a migration destination" in entry["reason"]
+
+
+async def test_destinations_includes_nutanix_when_array_shared(client):
+    """Regression for the reported bug: Nutanix declares Capability.MIGRATE, so
+    sharing an array with the source must make it an eligible destination."""
+    a1 = await _mk_array(client, "10.0.6.1")
+    src = await _make_hv(client, "proxmox", a1, "d8")
+    r = await client.post("/api/hypervisors", json={
+        "name": _uniq("hv-nutanix"), "connector_key": "nutanix",
+        "connection": {"pc_host": "pc.test", "pc_user": "admin",
+                       "cluster": "c1"},
+        "secrets": {"pc_password": "p"}, "array_id": a1})
+    assert r.status_code == 201, r.text
+    dst = r.json()["id"]
+
+    entry = _by_id((await client.get(
+        "/api/migrations/destinations",
+        params={"source_hypervisor_id": src})).json(), dst)
+    assert entry["eligible"] is True, entry["reason"]
+    assert entry["connector_key"] == "nutanix"
+
+
+# --------------------------------------------------------------------------- #
+# Only a REPLICATION array-connection makes a cross-array pair migratable.
+# --------------------------------------------------------------------------- #
+def test_is_replication_connection_rejects_fleet_management():
+    """Observed live: an array carried
+    'Solutions-Engineering-Fleet-<remote>' of type fleet-management, whose
+    remote.name equals the remote array. Matching on name alone made an
+    unreplicated pair look migration-ready."""
+    from phif.api.migrations import _is_replication_connection as is_repl
+
+    assert is_repl("async-replication") is True
+    assert is_repl("sync-replication") is True
+    # The false positive this guards against:
+    assert is_repl("fleet-management") is False
+    assert is_repl("") is False
+    assert is_repl(None) is False
+
+
+async def test_cross_array_fleet_only_connection_needs_authorization(client, monkeypatch):
+    """A pair joined ONLY by fleet-management must still require authorization:
+    fleet-management federates management, it cannot carry a volume."""
+    from phif.flasharray.client import MockFlashArrayClient
+
+    a1 = await _mk_array(client, "10.0.7.1")
+    a2 = await _mk_array(client, "10.0.7.2")
+    src = await _make_hv(client, "proxmox", a1, "fm1")
+    dst = await _make_hv(client, "xcpng", a2, "fm2")
+
+    # The mock array's array_name() is its endpoint, so this is the name the
+    # helper matches on. Using it means the NAME matches and only the TYPE can
+    # distinguish the two cases -- otherwise the test would pass for the wrong
+    # reason (a name mismatch) even without the type filter.
+    dest_name = "10.0.7.2"
+    orig = MockFlashArrayClient.list_array_connections
+
+    async def _fleet_only(self):
+        return [{"name": dest_name, "type": "fleet-management", "status": "connected"}]
+
+    monkeypatch.setattr(MockFlashArrayClient, "list_array_connections", _fleet_only)
+    try:
+        r = await client.get("/api/migrations/precheck",
+                             params={"source_hypervisor_id": src,
+                                     "dest_hypervisor_id": dst})
+        pc = r.json()
+        assert pc["cross_array"] is True
+        assert pc["connection_exists"] is False, "fleet-management is not replication"
+        assert pc["needs_authorization"] is True
+
+        entry = _by_id((await client.get(
+            "/api/migrations/destinations",
+            params={"source_hypervisor_id": src})).json(), dst)
+        assert entry["needs_authorization"] is True
+        assert "must be authorized" in entry["reason"]
+
+        # And the submit path must refuse without explicit authorization.
+        r = await client.post("/api/migrations", json={
+            "source_hypervisor_id": src, "dest_hypervisor_id": dst,
+            "vm_ref": "100", "network_map": {}})
+        assert r.status_code == 409
+    finally:
+        monkeypatch.setattr(MockFlashArrayClient, "list_array_connections", orig)
+
+
+async def test_cross_array_replication_connection_is_accepted(client, monkeypatch):
+    """The positive case: a real replication connection needs no authorization."""
+    from phif.flasharray.client import MockFlashArrayClient
+
+    a1 = await _mk_array(client, "10.0.8.1")
+    a2 = await _mk_array(client, "10.0.8.2")
+    src = await _make_hv(client, "proxmox", a1, "rp1")
+    dst = await _make_hv(client, "xcpng", a2, "rp2")
+
+    dest_name = "10.0.8.2"   # the destination array's endpoint == its array_name()
+    orig = MockFlashArrayClient.list_array_connections
+
+    async def _replicated(self):
+        return [{"name": dest_name, "type": "async-replication", "status": "connected"}]
+
+    monkeypatch.setattr(MockFlashArrayClient, "list_array_connections", _replicated)
+    try:
+        pc = (await client.get("/api/migrations/precheck",
+                               params={"source_hypervisor_id": src,
+                                       "dest_hypervisor_id": dst})).json()
+        assert pc["connection_exists"] is True
+        assert pc["needs_authorization"] is False
+
+        entry = _by_id((await client.get(
+            "/api/migrations/destinations",
+            params={"source_hypervisor_id": src})).json(), dst)
+        assert entry["eligible"] is True
+        assert entry["needs_authorization"] is False
+        assert "replication connection" in entry["reason"]
+    finally:
+        monkeypatch.setattr(MockFlashArrayClient, "list_array_connections", orig)

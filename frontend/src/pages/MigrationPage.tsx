@@ -1,16 +1,17 @@
 import { useEffect, useMemo, useState } from "react";
 import { api } from "../api/client";
-import type { Hypervisor, NetworkSummary, Placement, VmSpec, VmSummary } from "../api/client";
+import type {
+  Hypervisor, MigrationDestination, NetworkSummary, Placement, VmSpec, VmSummary,
+} from "../api/client";
 import { LiveLog, useAsync } from "../components";
 import MigrationGroupsPanel from "./MigrationGroupsPanel";
+import { useMigrateConnectors } from "../hooks/useMigrateConnectors";
 
 // Cross-hypervisor VM migration (cold/reboot cutover). The same FlashArray
 // volume(s) are re-pointed from the source to the destination — no data moves.
 // Steps: pick source HV + VM → pick destination HV (same array) → map each NIC
 // to a destination network → review matched hardware → run with a live log.
 type Step = "source" | "destination" | "network" | "run";
-
-const MIGRATE_CONNECTORS = new Set(["proxmox", "xcpng", "hpevme", "vsphere", "openstack", "openshift"]);
 
 function mib(bytes?: number | null): string {
   if (!bytes) return "—";
@@ -31,6 +32,9 @@ export default function MigrationPage() {
   const [networkMap, setNetworkMap] = useState<Record<string, string>>({});
   // Destination placement: Everpure-connected clusters + their Everpure storage (HPE/XCP).
   const [placements, setPlacements] = useState<Placement[] | null>(null);
+  // Backend verdict per candidate destination: same array, or replication
+  // between the arrays. Keeps the picker consistent with what submit enforces.
+  const [destVerdicts, setDestVerdicts] = useState<MigrationDestination[] | null>(null);
   const [destCluster, setDestCluster] = useState("");
   const [destStorage, setDestStorage] = useState("");
   const [mode, setMode] = useState<"move" | "copy">("move");
@@ -49,10 +53,12 @@ export default function MigrationPage() {
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState<string | null>(null);
 
-  // Only migration-capable hypervisors are eligible.
+  // Only migration-capable hypervisors are eligible. The set comes from the
+  // backend's connector descriptors (Capability.MIGRATE), not a list held here.
+  const { filterMigratable, ready: connectorsReady } = useMigrateConnectors();
   const eligible = useMemo<Hypervisor[]>(
-    () => (hypervisors.data ?? []).filter((h) => MIGRATE_CONNECTORS.has(h.connector_key)),
-    [hypervisors.data],
+    () => filterMigratable(hypervisors.data),
+    [hypervisors.data, filterMigratable],
   );
   const source = eligible.find((h) => h.id === sourceId);
   const dest = eligible.find((h) => h.id === destId);
@@ -70,11 +76,26 @@ export default function MigrationPage() {
   useEffect(() => {
     if (!powerOnTouched) setPowerOn(mode === "move" ? sourceRunning : false);
   }, [mode, sourceRunning, powerOnTouched]);
-  // Destination must have a FlashArray. It may be the SAME array (re-map/clone) or
-  // a DIFFERENT array (volume sent via replication — may need authorization).
-  const destChoices = eligible.filter(
-    (h) => h.id !== sourceId && source?.array_id && h.array_id,
-  );
+  // Destination eligibility is decided by the BACKEND (/migrations/destinations):
+  // the same FlashArray, or a replication connection between the two arrays.
+  // The UI used to approximate it as "has any array", which offered destinations
+  // that only failed with a 409 after the operator had picked one.
+  const verdictFor = (id: string) => destVerdicts?.find((d) => d.id === id);
+  const destChoices = useMemo<Hypervisor[]>(() => {
+    if (destVerdicts == null) return [];
+    const known = new Map(destVerdicts.map((d) => [d.id, d]));
+    return eligible.filter((h) => h.id !== sourceId && known.has(h.id));
+  }, [eligible, sourceId, destVerdicts]);
+
+  // Refresh the eligibility verdicts whenever the source changes.
+  useEffect(() => {
+    if (!sourceId) { setDestVerdicts(null); return; }
+    let cancelled = false;
+    api.migrationDestinations(sourceId)
+      .then((r) => { if (!cancelled) setDestVerdicts(r.destinations); })
+      .catch(() => { if (!cancelled) setDestVerdicts([]); });
+    return () => { cancelled = true; };
+  }, [sourceId]);
 
   const loadVms = async (id: string) => {
     setBusy(true);
@@ -291,6 +312,16 @@ export default function MigrationPage() {
               <option key={h.id} value={h.id}>{h.name} ({h.connector_key})</option>
             ))}
           </select>
+          {eligible.length === 0 && (
+            <div className="muted" style={{ fontSize: 13, marginTop: 6 }}>
+              {/* Distinguish "still fetching the connector descriptors" from
+                  "genuinely nothing connected" -- an unexplained empty picker is
+                  what made the Nutanix connector look misconfigured. */}
+              {connectorsReady
+                ? "No migration-capable hypervisors are connected yet."
+                : "Loading migration-capable connectors…"}
+            </div>
+          )}
           {sourceId && !source?.array_id && (
             <div className="error">
               This hypervisor has no associated FlashArray — migration requires one.
@@ -323,16 +354,40 @@ export default function MigrationPage() {
           <label>Destination hypervisor * (same array, or a different array via replication)</label>
           <select value={destId} onChange={(e) => onDestChange(e.target.value)}>
             <option value="">Select…</option>
-            {destChoices.map((h) => (
-              <option key={h.id} value={h.id}>{h.name} ({h.connector_key})</option>
-            ))}
+            {destChoices.map((h) => {
+              const v = verdictFor(h.id);
+              // Ineligible candidates stay VISIBLE but disabled, with the reason
+              // inline. Omitting them reads as a misconfiguration and sends
+              // people hunting through array/host-group settings for nothing.
+              const label = `${h.name} (${h.connector_key})`;
+              return (
+                <option key={h.id} value={h.id} disabled={v ? !v.eligible : false}>
+                  {v && !v.eligible ? `${label} — unavailable: ${v.reason}` : label}
+                  {v?.eligible && v.needs_authorization ? " — needs array-connection approval" : ""}
+                </option>
+              );
+            })}
           </select>
-          {destChoices.length === 0 && (
+          {destVerdicts != null && destChoices.length === 0 && (
             <div className="muted" style={{ fontSize: 13, marginTop: 6 }}>
               No eligible destinations: you need another migration-capable hypervisor
-              associated with a FlashArray.
+              associated with a FlashArray — either the same array as the source, or
+              one with a replication connection to it.
             </div>
           )}
+          {(() => {
+            const v = destId ? verdictFor(destId) : undefined;
+            if (!v) return null;
+            return (
+              <div
+                className={v.eligible ? "muted" : "error"}
+                style={{ fontSize: 13, marginTop: 6 }}
+              >
+                {v.eligible ? "✓ " : "✗ "}
+                {v.reason}
+              </div>
+            );
+          })()}
           {placements && placements.length > 0 && (
             <>
               <label style={{ marginTop: 12 }}>Cluster * (only clusters with an Everpure connection)</label>
