@@ -734,3 +734,60 @@ def test_serial_from_naa_handles_naa_and_vml_forms():
     assert V._serial_from_naa("/vmfs/devices/disks/naa.624a93700123456789abcdef0bebde3b") == "0123456789abcdef0bebde3b"
     assert V._serial_from_naa("naa.6000970000123456789abcdef0123456") is None  # non-Everpure
     assert V._serial_from_naa("") is None
+
+
+# --------------------------------------------------------------------------- #
+# An unreachable vCenter must not look like an empty inventory
+#
+# list_vms/list_networks used to `except Exception: return []`, so a vCenter
+# refusing connections produced an empty VM list with no explanation. In the
+# migration wizard that reads as "my VMs are being filtered out" — it cost real
+# time chasing a phantom vVol filter when the vCenter was simply down.
+# --------------------------------------------------------------------------- #
+async def test_list_vms_surfaces_a_connection_failure(make_context, monkeypatch):
+    from phif.connectors.base import ConnectionValidationError
+
+    ctx = _ctx(make_context)
+    ctx.runner.mock = False
+    ctx.runner.dry_run = False
+    c = VSphereConnector(ctx)
+
+    def _boom():
+        raise ConnectionRefusedError(111, "Connection refused")
+
+    monkeypatch.setattr(c, "_si_sync", _boom)
+    with pytest.raises(ConnectionValidationError) as e:
+        await c.list_vms()
+    msg = str(e.value)
+    assert "Could not list VMs" in msg
+    assert "Connection refused" in msg, "the underlying cause must survive"
+    assert ctx.target.get("vcenter_host") in msg, "say WHICH vCenter failed"
+
+
+async def test_list_networks_surfaces_a_connection_failure(make_context, monkeypatch):
+    from phif.connectors.base import ConnectionValidationError
+
+    ctx = _ctx(make_context)
+    ctx.runner.mock = False
+    ctx.runner.dry_run = False
+    c = VSphereConnector(ctx)
+
+    def _boom():
+        raise ConnectionRefusedError(111, "Connection refused")
+
+    monkeypatch.setattr(c, "_si_sync", _boom)
+    with pytest.raises(ConnectionValidationError):
+        await c.list_networks()
+
+
+async def test_list_vms_does_not_filter_by_disk_backing(make_context):
+    """There is no vVol/VMFS/RDM filter in list_vms — every VM is listed
+    regardless of how its disks are backed. Guards against someone 'helpfully'
+    hiding vVol VMs, which the connector can now migrate."""
+    import inspect
+
+    src = inspect.getsource(VSphereConnector.list_vms)
+    for token in ("VVOL", "vvol", "RawDiskMapping", "datastore.summary.type"):
+        assert token not in src, (
+            f"list_vms references {token!r} — it must not filter VMs by how "
+            f"their disks are backed")

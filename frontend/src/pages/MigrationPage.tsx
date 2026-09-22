@@ -28,6 +28,10 @@ export default function MigrationPage() {
   const [vmRef, setVmRef] = useState("");
   const [destId, setDestId] = useState("");
   const [vms, setVms] = useState<VmSummary[] | null>(null);
+  // Free-text filter over the VM list. A real vCenter can hold hundreds of VMs
+  // (169 on the lab instance), which makes an unfiltered <select> unusable —
+  // and makes a handful of interesting VMs look as though they were filtered out.
+  const [vmQuery, setVmQuery] = useState("");
   const [spec, setSpec] = useState<VmSpec | null>(null);
   const [destNets, setDestNets] = useState<NetworkSummary[] | null>(null);
   const [networkMap, setNetworkMap] = useState<Record<string, string>>({});
@@ -103,6 +107,7 @@ export default function MigrationPage() {
 
   // Changing the source invalidates any verdicts held for the previous one.
   useEffect(() => { setDestVerdicts(null); }, [sourceId]);
+  useEffect(() => { setVmQuery(""); }, [sourceId]);
 
   const loadVms = async (id: string) => {
     setBusy(true);
@@ -157,6 +162,22 @@ export default function MigrationPage() {
       setErr(String((e as Error).message));
     }
   };
+
+  // Matches on name, power state and moRef id, so an operator can paste an id
+  // or type part of a name. Space-separated terms must ALL match, which is what
+  // makes narrowing a few hundred VMs practical.
+  const visibleVms = useMemo<VmSummary[]>(() => {
+    const terms = vmQuery.toLowerCase().split(/\s+/).filter(Boolean);
+    if (!terms.length) return vms ?? [];
+    return (vms ?? []).filter((v) => {
+      // Keep the current selection visible even when it no longer matches,
+      // otherwise the <select> renders blank while vmRef is still set and the
+      // Next button stays enabled — looking like a lost selection.
+      if (v.id === vmRef) return true;
+      const hay = `${v.name ?? ""} ${v.power_state ?? ""} ${v.id ?? ""}`.toLowerCase();
+      return terms.every((term) => hay.includes(term));
+    });
+  }, [vms, vmQuery, vmRef]);
 
   const clusterStorage = useMemo(
     () => validPlacements(placements).find((p) => p.cluster.id === destCluster)?.storage ?? [],
@@ -337,14 +358,34 @@ export default function MigrationPage() {
           {sourceId && (
             <div style={{ marginTop: 12 }}>
               <label>VM to migrate *</label>
-              <select value={vmRef} onChange={(e) => setVmRef(e.target.value)} disabled={busy}>
+              <input
+                type="search"
+                placeholder="Filter by name, power state or id…"
+                value={vmQuery}
+                onChange={(e) => setVmQuery(e.target.value)}
+                disabled={busy || !(vms ?? []).length}
+                style={{ marginBottom: 6 }}
+              />
+              <select
+                value={vmRef}
+                onChange={(e) => setVmRef(e.target.value)}
+                disabled={busy}
+                size={Math.min(12, Math.max(2, visibleVms.length + 1))}
+              >
                 <option value="">{busy ? "Loading…" : "Select…"}</option>
-                {(vms ?? []).map((v) => (
+                {visibleVms.map((v) => (
                   <option key={v.id} value={v.id}>
                     {v.name} — {v.power_state} ({v.id})
                   </option>
                 ))}
               </select>
+              <div className="muted" style={{ fontSize: 12, marginTop: 4 }}>
+                {vmQuery
+                  ? `${visibleVms.length} of ${(vms ?? []).length} VMs match`
+                  : `${(vms ?? []).length} VMs`}
+                {vmQuery && visibleVms.length === 0
+                  && " — nothing matches this filter"}
+              </div>
             </div>
           )}
           <div style={{ marginTop: 14 }}>

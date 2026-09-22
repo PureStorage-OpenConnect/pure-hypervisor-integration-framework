@@ -1875,8 +1875,15 @@ class VSphereConnector(HypervisorConnector):
 
         try:
             return await asyncio.to_thread(_list_sync)
-        except Exception:
-            return []
+        except Exception as exc:  # noqa: BLE001
+            # Do NOT return [] here. An unreachable vCenter then looks exactly
+            # like an empty inventory, and the migration wizard shows a blank VM
+            # list with no hint why — which reads as "my VMs are being filtered
+            # out". Surface it; the API turns this into a 400 the UI displays.
+            raise ConnectionValidationError(
+                f"Could not list VMs from vCenter "
+                f"{self.ctx.target.get('vcenter_host')}: "
+                f"{type(exc).__name__}: {exc}") from exc
 
     async def list_networks(self) -> list[dict[str, Any]]:
         """Enumerate networks from vCenter via pyVmomi."""
@@ -1896,8 +1903,14 @@ class VSphereConnector(HypervisorConnector):
 
         try:
             return await asyncio.to_thread(_list_sync)
-        except Exception:
-            return []
+        except Exception as exc:  # noqa: BLE001
+            # Same reasoning as list_vms: an empty network list is a legitimate
+            # answer, so hiding a connection failure behind it makes the
+            # migration wizard fail later with a confusing "network not found".
+            raise ConnectionValidationError(
+                f"Could not list networks from vCenter "
+                f"{self.ctx.target.get('vcenter_host')}: "
+                f"{type(exc).__name__}: {exc}") from exc
 
     async def list_placements(self) -> list[dict[str, Any]]:
         """Return clusters with their Everpure-backed datastores for the migration wizard.
