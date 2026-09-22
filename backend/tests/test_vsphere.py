@@ -421,6 +421,31 @@ async def test_provision_nfs_missing_params(make_context):
     assert not r.success
 
 
+async def test_provision_vvol_datastore_is_rejected(make_context):
+    """type='vvol' must fail loudly, not quietly build a VMFS datastore.
+
+    It previously fell through to the VMFS branch, producing a real VMFS
+    datastore merely labelled "vvol" plus a stray backing volume.
+    """
+    ctx = _ctx(make_context)
+    c = VSphereConnector(ctx)
+    r = await c.provision_datastore(name="vv1", size="1T", host_group="hg1", type="vvol")
+    assert not r.success
+    assert "not implemented" in r.message.lower()
+    # No backing volume left behind, and nothing connected to the host group.
+    assert "vv1" not in ctx.array.volumes
+    assert not any(op == "connect_volume" for op, _ in ctx.array.calls)
+
+
+def test_vvol_not_offered_as_a_datastore_type():
+    """The UI must not offer a type the connector refuses."""
+    spec = next(a for a in VSphereConnector.action_schemas()
+                if a.id == "provision_datastore")
+    type_field = next(f for f in spec.fields if f.name == "type")
+    assert "vvol" not in (type_field.options or [])
+    assert {"vmfs", "nfs"} <= set(type_field.options or [])
+
+
 # ---- volume / day-2 ops ----
 async def test_provision_volume(make_context):
     ctx = _ctx(make_context)
@@ -709,3 +734,60 @@ def test_serial_from_naa_handles_naa_and_vml_forms():
     assert V._serial_from_naa("/vmfs/devices/disks/naa.624a93700123456789abcdef0bebde3b") == "0123456789abcdef0bebde3b"
     assert V._serial_from_naa("naa.6000970000123456789abcdef0123456") is None  # non-Everpure
     assert V._serial_from_naa("") is None
+
+
+# --------------------------------------------------------------------------- #
+# An unreachable vCenter must not look like an empty inventory
+#
+# list_vms/list_networks used to `except Exception: return []`, so a vCenter
+# refusing connections produced an empty VM list with no explanation. In the
+# migration wizard that reads as "my VMs are being filtered out" — it cost real
+# time chasing a phantom vVol filter when the vCenter was simply down.
+# --------------------------------------------------------------------------- #
+async def test_list_vms_surfaces_a_connection_failure(make_context, monkeypatch):
+    from phif.connectors.base import ConnectionValidationError
+
+    ctx = _ctx(make_context)
+    ctx.runner.mock = False
+    ctx.runner.dry_run = False
+    c = VSphereConnector(ctx)
+
+    def _boom():
+        raise ConnectionRefusedError(111, "Connection refused")
+
+    monkeypatch.setattr(c, "_si_sync", _boom)
+    with pytest.raises(ConnectionValidationError) as e:
+        await c.list_vms()
+    msg = str(e.value)
+    assert "Could not list VMs" in msg
+    assert "Connection refused" in msg, "the underlying cause must survive"
+    assert ctx.target.get("vcenter_host") in msg, "say WHICH vCenter failed"
+
+
+async def test_list_networks_surfaces_a_connection_failure(make_context, monkeypatch):
+    from phif.connectors.base import ConnectionValidationError
+
+    ctx = _ctx(make_context)
+    ctx.runner.mock = False
+    ctx.runner.dry_run = False
+    c = VSphereConnector(ctx)
+
+    def _boom():
+        raise ConnectionRefusedError(111, "Connection refused")
+
+    monkeypatch.setattr(c, "_si_sync", _boom)
+    with pytest.raises(ConnectionValidationError):
+        await c.list_networks()
+
+
+async def test_list_vms_does_not_filter_by_disk_backing(make_context):
+    """There is no vVol/VMFS/RDM filter in list_vms — every VM is listed
+    regardless of how its disks are backed. Guards against someone 'helpfully'
+    hiding vVol VMs, which the connector can now migrate."""
+    import inspect
+
+    src = inspect.getsource(VSphereConnector.list_vms)
+    for token in ("VVOL", "vvol", "RawDiskMapping", "datastore.summary.type"):
+        assert token not in src, (
+            f"list_vms references {token!r} — it must not filter VMs by how "
+            f"their disks are backed")

@@ -403,7 +403,7 @@ class JobRunner:
         await self.log(f"[http] {method.upper()} {url}")
         if self.mock or self.dry_run:
             await self.log("[http] (mock/dry-run) skipped")
-            return {"status_code": 200, "json": {}}
+            return {"status_code": 200, "json": {}, "text": "", "headers": {}}
 
         import httpx
 
@@ -424,7 +424,11 @@ class JobRunner:
                 body = resp.json()
             except Exception:
                 body = {}
-            return {"status_code": resp.status_code, "json": body, "text": resp.text}
+            # `headers` is lower-cased so callers can look a header up without
+            # guessing its casing. Prism, for one, returns "Etag" rather than
+            # the "ETag" spelling an optimistic-concurrency caller expects.
+            return {"status_code": resp.status_code, "json": body, "text": resp.text,
+                    "headers": {k.lower(): v for k, v in resp.headers.items()}}
 
     # --------------------------------------------------------------- local ---
     async def run_local(self, command: str, *, check: bool = True,

@@ -150,6 +150,11 @@ class MigrationCreate(BaseModel):
     # source-network identifier -> destination-network id
     network_map: dict[str, str] = {}
     options: dict[str, Any] = {}
+    # Validate and PLAN the migration without changing anything: no VM is
+    # created, no volume copied, nothing deleted. Previously `dry_run` existed
+    # only on OperationRequest, so sending it here was accepted and ignored —
+    # which reads exactly like a safe rehearsal while running for real.
+    dry_run: bool = False
 
 
 class MigrationOut(BaseModel):

@@ -1,5 +1,7 @@
 import { useEffect, useMemo, useState } from "react";
 import { api } from "../api/client";
+import { useMigrateConnectors } from "../hooks/useMigrateConnectors";
+import { validPlacements } from "../utils/placements";
 import type {
   Hypervisor, MigrationGroup, NetworkSummary, Placement, VmSpec, VmSummary,
 } from "../api/client";
@@ -8,8 +10,6 @@ import type {
 // hypervisor to one destination (same FlashArray) with a shared network map and
 // options, run together up to `concurrency` at once — now or at a scheduled time.
 // The single-VM wizard lives in MigrationPage; this panel is the multi-VM path.
-
-const MIGRATE_CONNECTORS = new Set(["proxmox", "xcpng", "hpevme", "vsphere", "openstack", "openshift"]);
 
 function statusClass(s: string): string {
   if (s === "succeeded") return "ga";
@@ -129,16 +129,19 @@ export default function MigrationGroupsPanel({ hypervisors }: { hypervisors: Hyp
   const [err, setErr] = useState<string | null>(null);
   const [msg, setMsg] = useState<string | null>(null);
 
+  // Migration-capable connectors come from the backend descriptors
+  // (Capability.MIGRATE), never a list hardcoded in the UI.
+  const { filterMigratable } = useMigrateConnectors();
   const eligible = useMemo(
-    () => hypervisors.filter((h) => MIGRATE_CONNECTORS.has(h.connector_key)),
-    [hypervisors],
+    () => filterMigratable(hypervisors),
+    [hypervisors, filterMigratable],
   );
   const source = eligible.find((h) => h.id === sourceId);
   const dest = eligible.find((h) => h.id === destId);
   const destIsVsphere = dest?.connector_key === "vsphere";
   const destChoices = eligible.filter((h) => h.id !== sourceId && source?.array_id && h.array_id);
   const clusterStorage = useMemo(
-    () => placements?.find((p) => p.cluster.id === destCluster)?.storage ?? [],
+    () => validPlacements(placements).find((p) => p.cluster.id === destCluster)?.storage ?? [],
     [placements, destCluster],
   );
   const placementReady = !placements || placements.length === 0 || (!!destCluster && !!destStorage);
@@ -159,7 +162,7 @@ export default function MigrationGroupsPanel({ hypervisors }: { hypervisors: Hyp
       const [ps, nets] = await Promise.all([api.listPlacements(id), api.listNetworks(id)]);
       setPlacements(ps); setDestNets(nets);
       if (ps.length === 1) {
-        setDestCluster(ps[0].cluster.id);
+        setDestCluster(validPlacements(ps)[0]?.cluster.id ?? "");
         if (ps[0].storage.length === 1) setDestStorage(ps[0].storage[0].id);
       }
     } catch (e) { setErr(String((e as Error).message)); }
@@ -277,7 +280,7 @@ export default function MigrationGroupsPanel({ hypervisors }: { hypervisors: Hyp
               <label>Cluster *</label>
               <select value={destCluster} onChange={(e) => { setDestCluster(e.target.value); setDestStorage(""); }}>
                 <option value="">Select…</option>
-                {placements.map((p) => <option key={p.cluster.id} value={p.cluster.id}>{p.cluster.name}</option>)}
+                {validPlacements(placements).map((p) => <option key={p.cluster.id} value={p.cluster.id}>{p.cluster.name}</option>)}
               </select>
             </div>
             <div style={{ flex: 1, minWidth: 240 }}>

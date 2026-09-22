@@ -234,7 +234,11 @@ class VSphereConnector(HypervisorConnector):
                     FormField("size", "Size", FieldType.SIZE, default="1T"),
                     FormField("host_group", "ESXi host group", FieldType.STRING),
                     FormField("type", "Datastore type", FieldType.ENUM, default="vmfs",
-                              options=["vmfs", "nfs", "vvol"]),
+                              options=["vmfs", "nfs"],
+                              help="vVol datastore provisioning is not implemented "
+                                   "(vVols are deprecated); create the vVol datastore "
+                                   "in vCenter. Migrating VMs on or off an existing "
+                                   "vVol datastore IS supported."),
                     FormField("protocol", "Transport (block datastores)", FieldType.ENUM,
                               default="iscsi", required=False,
                               options=["iscsi", "fc", "nvme-fc", "nvme-roce"],
@@ -1608,10 +1612,23 @@ class VSphereConnector(HypervisorConnector):
                            "nfs": f"{nfs_server}:{nfs_path}"},
             )
 
+        if ds_type == "vvol":
+            # This branch used to fall through to the VMFS path below, which
+            # created a backing volume and laid VMFS on it — a VMFS datastore
+            # merely labelled "vvol". vVol provisioning needs a protocol
+            # endpoint and a VASA-advertised storage container instead, and
+            # vVols are deprecated, so it is deliberately not implemented.
+            # vVol *migration* is supported; see capture_vm_spec.
+            return OpResult.fail(
+                "vVol datastore provisioning is not implemented. Create the vVol "
+                "datastore in vCenter (Storage Providers + storage container), then "
+                "use this connector to migrate VMs on or off it. Choose 'vmfs' or "
+                "'nfs' to provision a datastore here.")
+
         if self.ctx.array is None:
             return OpResult.fail("No FlashArray associated with this hypervisor")
         if not host_group:
-            return OpResult.fail("host_group is required for VMFS/vVol datastores")
+            return OpResult.fail("host_group is required for VMFS datastores")
         if self.ctx.dry_run:
             return OpResult.ok(f"Dry-run: {ds_type} datastore {name} planned")
 
@@ -1858,8 +1875,15 @@ class VSphereConnector(HypervisorConnector):
 
         try:
             return await asyncio.to_thread(_list_sync)
-        except Exception:
-            return []
+        except Exception as exc:  # noqa: BLE001
+            # Do NOT return [] here. An unreachable vCenter then looks exactly
+            # like an empty inventory, and the migration wizard shows a blank VM
+            # list with no hint why — which reads as "my VMs are being filtered
+            # out". Surface it; the API turns this into a 400 the UI displays.
+            raise ConnectionValidationError(
+                f"Could not list VMs from vCenter "
+                f"{self.ctx.target.get('vcenter_host')}: "
+                f"{type(exc).__name__}: {exc}") from exc
 
     async def list_networks(self) -> list[dict[str, Any]]:
         """Enumerate networks from vCenter via pyVmomi."""
@@ -1879,8 +1903,14 @@ class VSphereConnector(HypervisorConnector):
 
         try:
             return await asyncio.to_thread(_list_sync)
-        except Exception:
-            return []
+        except Exception as exc:  # noqa: BLE001
+            # Same reasoning as list_vms: an empty network list is a legitimate
+            # answer, so hiding a connection failure behind it makes the
+            # migration wizard fail later with a confusing "network not found".
+            raise ConnectionValidationError(
+                f"Could not list networks from vCenter "
+                f"{self.ctx.target.get('vcenter_host')}: "
+                f"{type(exc).__name__}: {exc}") from exc
 
     async def list_placements(self) -> list[dict[str, Any]]:
         """Return clusters with their Everpure-backed datastores for the migration wizard.
@@ -2002,11 +2032,17 @@ class VSphereConnector(HypervisorConnector):
                         except Exception:
                             is_vvol = False
                         if is_vvol:
+                            # backingObjectId is the vVol id ("rfc4122.<uuid>").
+                            # It resolves to the backing FA volume exactly, via
+                            # the PURE_VVOL_ID tag the VASA provider writes —
+                            # see FlashArrayClient.find_volume_by_vvol_id. The
+                            # serial is filled in below, once the array is known.
                             disk_types[key_str] = "vvol"
                             disks_raw.append({
                                 "key_str": key_str, "order": order, "boot": boot,
                                 "size_bytes": size_bytes, "disk_type": "vvol",
                                 "serial": None, "fa_volume": "",
+                                "vvol_id": getattr(backing, "backingObjectId", None),
                             })
                         else:
                             disk_types[key_str] = "vmfs"
@@ -2061,6 +2097,23 @@ class VSphereConnector(HypervisorConnector):
         for dr in raw["disks_raw"]:
             serial = dr["serial"]
             fa_volume = dr["fa_volume"]
+            # vVol disks carry no device serial of their own; resolve both the
+            # volume name and the serial from the vVol id. Unresolved vVols are
+            # left with serial=None so preflight reports them as unmappable,
+            # rather than silently migrating the wrong volume.
+            vvol_id = dr.get("vvol_id")
+            if vvol_id and not serial and self.ctx.array is not None:
+                vol = await self.ctx.array.find_volume_by_vvol_id(vvol_id)
+                if vol:
+                    fa_volume = fa_volume or vol["name"]
+                    serial = vol.get("serial")
+                    await self.ctx.emit(
+                        f"[vvol] {vvol_id} -> {fa_volume} serial={serial}")
+                else:
+                    await self.ctx.emit(
+                        f"[vvol] {vvol_id} did not resolve to a volume on "
+                        f"{self.ctx.array.endpoint} — the vVol may live on a "
+                        f"different array")
             if serial and not fa_volume and self.ctx.array is not None:
                 fa_volume = await self.ctx.array.find_volume_name_by_serial(serial) or ""
             disks.append(DiskSpec(
@@ -2505,11 +2558,13 @@ class VSphereConnector(HypervisorConnector):
                     except Exception:
                         is_vvol = False
                     if is_vvol:
-                        # Attempt to extract vVol id from backing file path
-                        fp = getattr(backing, "fileName", "") or ""
+                        # The vVol id is backingObjectId ("rfc4122.<uuid>"), NOT
+                        # the backing file path — the path names the config-vVol
+                        # directory and resolves to nothing on the array.
                         result["backing"] = {
                             "type": "VIRTUAL_VOLUME_BACKING",
-                            "vvol_id": fp,
+                            "vvol_id": getattr(backing, "backingObjectId", "") or "",
+                            "file_name": getattr(backing, "fileName", "") or "",
                         }
                     else:
                         result["backing"] = {"type": "VMDK_FILE",
@@ -2995,7 +3050,12 @@ class VSphereConnector(HypervisorConnector):
                 vvol_id = (vvol_raw.get("id") if isinstance(vvol_raw, dict)
                            else str(vvol_raw)) if vvol_raw else ""
                 if vvol_id:
-                    fa_volume = await self.ctx.array.find_volume_name_by_serial(vvol_id) or ""
+                    # Resolve through the VASA PURE_VVOL_ID tag. (This used to
+                    # call find_volume_name_by_serial with the backing file
+                    # path, which never matched, so every vVol create silently
+                    # fell through to the RDM path below.)
+                    vol = await self.ctx.array.find_volume_by_vvol_id(vvol_id)
+                    fa_volume = vol["name"] if vol else ""
                     if fa_volume:
                         await self.ctx.emit(
                             f"[vsphere] created vVol disk {fa_volume} ({size_gib}G) "

@@ -19,7 +19,7 @@
 One framework + web UI to connect a FlashArray, mint the API keys integrations
 need, attach hypervisors, deploy the right storage integration onto each, and run
 day-2 storage operations — across **vSphere, OpenShift, OpenStack, Proxmox,
-XCP-ng, and HPE VM Essentials**.
+XCP-ng, HPE VM Essentials, and Nutanix AHV**.
 
 PHIF does not reinvent the underlying integrations. It **automates the deployment
 and configuration** of them (vSphere plugin + VASA, the Kubernetes/OpenShift CSI
@@ -37,7 +37,8 @@ capability-driven interface.
 └──────────────┘     │  • Job engine (Ansible / SSH / HTTP + logs) │
                      │  • Encrypted secrets vault                  │
                      │  • Connectors: vsphere, openshift, openstack│
-                     │    proxmox, xcpng, hpevme (+ example)       │
+                     │    proxmox, xcpng, hpevme, nutanix         │
+                     │    (+ example)                              │
                      └─────────────────────────────────────────────┘
                                   │ REST / SSH / Ansible / k8s API
                      ┌────────────┴────────────┐
@@ -124,16 +125,19 @@ exercisable without real infrastructure.
 | Proxmox | `ga` | Custom PVE storage plugin (`purefa`): one FA volume per disk, array snapshots/clones | ✅ live 2-node PVE cluster |
 | XCP-ng | `ga` | Custom SMAPIv3 driver (volume + datapath + host plugin): one FA volume per VDI, array snapshots/clones | ✅ live 2-host pool, XCP-ng 8.3 / xapi 25.6 |
 | HPE VME | `ga` | Native Morpheus/VME storage plugin (Java/Groovy under `connectors/hpevme/files/morpheus-plugin/`): per-VM-disk FA volumes, array-offloaded snap/clone/resize, VME-native libvirt attach via `MvmProvisionFacet`. PHIF connector uploads the plugin (`deploy`) + registers the storage server (`configure`). | ✅ live VME appliance: provision, image deploy, clone-from-VM, snapshot create/revert/delete |
-| vSphere | `ga` | vSphere Client plugin + VASA/vVols, FlashArray REST, `purestorage.flasharray` | ✅ live vCenter: plugin + VASA deploy, VMFS/RDM datastore provisioning |
+| vSphere | `ga` | vSphere Client plugin + VASA/vVols, FlashArray REST, `purestorage.flasharray` | ✅ live vCenter: plugin + VASA deploy, VMFS/RDM datastore provisioning, vVol→FA volume resolution for migration |
 | OpenShift | `ga` | Portworx (px-csi) via the Portworx Operator (manifest) + StorageCluster (Portworx Central spec or generated FADA) | ✅ live OCP 4.22 single-node + FA-X20R3: Portworx install, PVC provision |
 | OpenStack | `ga` | Cinder driver (PureISCSI/FC/NVME) | ✅ live controller: Cinder backend deploy → configure → provision |
+| Nutanix AHV | `preview` | FlashArray as AHV **external storage** (NVMe-oF/TCP): one FA volume per vDisk, driven via Prism Central. External-storage registration itself is **not** implemented — do it in Prism. | ⚠️ live Prism Central (AOS 7.6 / AHV 11.2, 3-node) + FA-XL130 on Purity 6.12.2: inventory, vDisk→FA volume resolution, and VM lifecycle (create VM, add disk, detach, delete) all exercised on hardware. Migration validated by **dry run in both directions**; no full migration executed end-to-end yet |
 
 Proxmox, XCP-ng, and HPE VME follow the CSI/Cinder "storage plugin" model — each VM disk is
 its own FlashArray volume presented directly to the VM (no LVM), with snapshots and
 clones performed on the array.
 
-**VM migration is validated in both directions between all supported hypervisors**,
-on live hardware sharing one FlashArray.
+**VM migration is validated in both directions between Proxmox, XCP-ng, HPE VME,
+OpenShift Virtualization and vSphere**, on live hardware sharing one FlashArray.
+The Nutanix connector's migration paths are **not** hardware-validated yet — see
+the connector table above.
 
 ## VM Migration
 
@@ -187,8 +191,15 @@ datastore, not a 1:1 FA volume.
   form), resolves the 24-hex serial against the **connected** FlashArray, and uses that
   volume. A disk (RDM or vVol) whose serial does **not** resolve to a volume on the
   connected array (a non-Everpure RDM, or an Everpure volume on a different array) is rejected
-  with a clear preflight error. *(Native vVol-source resolution is not yet implemented —
-  a vVol-backed VM is currently rejected as unmappable rather than silently failing.)*
+  with a clear preflight error.
+* **vVol** disks are resolved exactly, with no size or name guessing. A vVol has no
+  device serial of its own, so PHIF reads the disk's vVol id
+  (`backingObjectId`, e.g. `rfc4122.<uuid>`) from vCenter and looks it up against the
+  FlashArray tag `PURE_VVOL_ID` in the `vasa-integration.purestorage.com` namespace —
+  the mapping the Everpure VASA provider maintains. That yields the backing volume and
+  its serial, after which a vVol disk migrates on the same path as an RDM. A vVol id
+  that does not resolve on the connected array (commonly because the vVol lives on a
+  *different* array) is reported as unmappable rather than guessed at.
 * **VMFS** disks have no per-disk FA volume. PHIF provisions a new FA volume per disk,
   presents it to the ESXi host as a raw device mapping (RDM), and clones the VMDK's
   data onto it with `vmkfstools` (VAAI/XCOPY-accelerated on the array). For a *copy*
@@ -244,6 +255,8 @@ down automatically after the conversion (and on rollback).
   copy-with-overwrite for *copy* mode) is performed — no host data movement.
 * Migrate live (hot) VMs — this is a cold cutover only.
 * Transfer UEFI NVRAM / efivars — a fresh efidisk is created on UEFI destinations.
+* Recreate CD-ROM / optical drives — the destination VM is built with **no optical
+  drive**, even when the source had one. See the known issue below.
 * Move non-Everpure disks — only FA-backed volumes (or vSphere VMFS/vVol/RDM disks) are supported.
 * Replication — source and destination must share the same physical array.
 
@@ -252,13 +265,58 @@ down automatically after the conversion (and on rollback).
 Being an experimental project, PHIF has rough edges that are documented rather
 than hidden. Please read these before filing an issue.
 
-* **vSphere vVol sources are rejected, not migrated.** Native vVol-source
-  resolution is unimplemented; a vVol-backed VM fails preflight with a clear
-  error rather than silently mismigrating.
+* **A Nutanix *move* source does not finish cleanly.** AHV cannot delete a VM
+  while keeping its vDisks, so the connector refuses
+  `delete_vm(keep_disks=True)`. `_finalize_move` now detects that and **leaves
+  the source volumes alone** rather than eradicating them behind a VM that still
+  owns them, and says so in the job log. The migration still succeeds — the
+  destination runs off its own copies — but the source VM and its volumes remain
+  and must be removed by hand. Nutanix as a migration **destination**, or as a
+  **copy** source, is unaffected.
+* **Nutanix: detaching a vDisk does not free its FlashArray volume.** The volume
+  stays live and connected to a stargate host; teardown must clean it up
+  explicitly.
+* **Nutanix: registering the FlashArray as external storage is not implemented.**
+  The Nutanix connector consumes an AHV cluster that *already* has the array
+  registered as an External Storage target; it does not perform that
+  registration (array service account, realm, pod, NVMe-oF/TCP interface
+  configuration, and the Prism Element registration). Do that in Prism first —
+  `validate_connection` fails with an explicit message if it is missing. The
+  connector accordingly does not advertise `deploy_plugin`, `configure`,
+  `provision_datastore`, `provision_volume`, `connectivity` or `host_register`.
+  Its VM-lifecycle and migration **write** paths are also unit-tested only, not
+  yet hardware-validated.
+* **vVol datastore provisioning is not implemented.** vVols are deprecated, so
+  `provision_datastore` refuses `type=vvol` (it previously fell through to the
+  VMFS path and produced a VMFS datastore merely *labelled* vvol). Create the
+  vVol datastore in vCenter — storage provider plus storage container — and PHIF
+  will migrate VMs on and off it. Registering/refreshing the VASA provider is
+  still supported via the `deploy` and `configure` actions.
 * **Migration is cold-cutover only** and requires source and destination to share
   one physical array. There is no live migration and no cross-array path.
 * **UEFI NVRAM / efivars are not transferred** — a UEFI destination VM gets a
   fresh efidisk, so custom boot entries and Secure Boot enrolment are lost.
+* **CD-ROM / optical drives are not migrated — this affects every connector.**
+  `VmSpec`, the normalized model every migration passes through, has no field for
+  optical devices, and no connector's `capture_vm_spec` reads one. A source
+  CD-ROM is therefore dropped at *capture* time, before any destination is
+  involved, so the destination VM is built without an optical drive.
+
+  Two consequences worth planning for:
+
+  * **Installing guest tools by the platform's native method usually needs a
+    CD-ROM.** Nutanix Guest Tools, VMware Tools, XCP-ng/XenServer guest tools
+    and the virtio-win drivers are all normally delivered as an ISO. On a
+    migrated VM there is no drive to attach it to, so **add a CD-ROM drive to
+    the destination VM first**, then mount the ISO. (Package-manager installs —
+    `qemu-guest-agent` and similar — need no drive.)
+  * Device enumeration can shift. A guest that saw an optical device on the
+    source will not see one on the destination, which can renumber devices or
+    leave a stale fstab/boot entry referencing it.
+
+  The media itself would not be portable anyway: a drive backed by node-local
+  storage (e.g. Proxmox `local:iso/…`) has no equivalent on the destination, so
+  any future support would recreate an *empty* drive rather than carry the ISO.
 * **No authentication on the PHIF UI or API.** PHIF serves over TLS but has no
   user login, RBAC, or audit identity. Anyone who can reach the port can drive
   every operation, including destructive ones. Keep it on a management network.

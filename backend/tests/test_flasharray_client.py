@@ -4,6 +4,8 @@ These don't touch a real array: a fake pypureclient-style SDK object records cal
 and returns canned responses (with status_code/errors/items) the way the SDK does.
 """
 
+import re
+
 import pytest
 
 from phif.flasharray.client import FlashArrayApiError, PureFlashArrayClient
@@ -190,3 +192,239 @@ async def test_call_idempotent_reraises_does_not_exist(monkeypatch):
     c = _client(fake, monkeypatch)
     with pytest.raises(FlashArrayApiError):
         await c.create_host_group("hg", ["h1"])
+
+
+# --------------------------------------------------------------------------- #
+# vVol resolution (PURE_VVOL_ID tag in the VASA namespace)
+# --------------------------------------------------------------------------- #
+class _Tag:
+    def __init__(self, key, value, resource_name):
+        self.key = key
+        self.value = value
+        self.resource = _Ref(resource_name)
+
+
+class _Vol:
+    def __init__(self, name, serial, provisioned=0, destroyed=False):
+        self.name = name
+        self.serial = serial
+        self.provisioned = provisioned
+        self.destroyed = destroyed
+
+
+class _VvolSDK(_FakeSDK):
+    """Volume + tag inventory shaped like a real array carrying vVols."""
+
+    def __init__(self, tags=None, vols=None, **kw):
+        super().__init__(**kw)
+        self._tags = tags or []
+        self._vols = vols or []
+
+    def get_volumes_tags(self, namespaces=None, filter=None, **kw):
+        self.calls.append(("get_volumes_tags", tuple(namespaces or []), filter))
+        # Mirror the real API: tags are only returned for requested namespaces,
+        # so a caller that forgets `namespaces` sees nothing useful.
+        if not namespaces:
+            return _Resp(items=[])
+        items = self._tags
+        # Honour the same key/value filter the real endpoint supports, so the
+        # test fails if the caller stops narrowing server-side.
+        if filter:
+            key = re.search(r"key='([^']*)'", filter)
+            val = re.search(r"value='([^']*)'", filter)
+            if key:
+                items = [t for t in items if t.key == key.group(1)]
+            if val:
+                items = [t for t in items if t.value == val.group(1)]
+        return _Resp(items=items)
+
+    def get_volumes(self, names=None, **kw):
+        self.calls.append(("get_volumes", tuple(names or [])))
+        items = self._vols
+        if names:
+            items = [v for v in self._vols if v.name in names]
+            if not items:
+                return _Resp(status_code=400, errors="Volume does not exist")
+        return _Resp(items=items)
+
+
+# Synthetic values in the exact shapes a live array/vCenter produces: a
+# pod-scoped vVol volume group, a Data vVol member, and a 24-hex FA serial.
+VVOL_ID = "rfc4122.00000000-1111-2222-3333-444444444444"
+VVOL_VOL = "ds-example::vvol-example-vm-0a1b2c3d-vg/Data-4e5f6a7b"
+VVOL_SERIAL = "ABCDEF0123456789ABCDEF01"
+
+
+def _vvol_sdk(**kw):
+    return _VvolSDK(
+        tags=[_Tag("PURE_VVOL_ID", VVOL_ID, VVOL_VOL),
+              _Tag("VMW_VVolType", "Data", VVOL_VOL)],
+        vols=[_Vol(VVOL_VOL, VVOL_SERIAL, provisioned=107374182400)],
+        **kw,
+    )
+
+
+async def test_find_volume_by_vvol_id_resolves_exactly(monkeypatch):
+    c = _client(_vvol_sdk(), monkeypatch)
+    got = await c.find_volume_by_vvol_id(VVOL_ID)
+    assert got == {"name": VVOL_VOL, "serial": VVOL_SERIAL}
+
+
+async def test_find_volume_by_vvol_id_requests_the_vasa_namespace(monkeypatch):
+    """Regression: an unnamespaced tags query returns only user tags, which
+    makes the VASA mapping look like it doesn't exist."""
+    fake = _vvol_sdk()
+    c = _client(fake, monkeypatch)
+    await c.find_volume_by_vvol_id(VVOL_ID)
+    tag_calls = [x for x in fake.calls if x[0] == "get_volumes_tags"]
+    assert tag_calls, "must query volume tags"
+    assert all("vasa-integration.purestorage.com" in x[1] for x in tag_calls)
+
+
+async def test_find_volume_by_vvol_id_narrows_server_side(monkeypatch):
+    """The namespace holds thousands of entries on a real array, so the match
+    must be pushed into `filter` rather than scanned client-side."""
+    fake = _vvol_sdk()
+    c = _client(fake, monkeypatch)
+    await c.find_volume_by_vvol_id(VVOL_ID)
+    flt = [x[2] for x in fake.calls if x[0] == "get_volumes_tags"][0]
+    assert flt, "tags query must pass a filter"
+    # Filtering on key as well as value matters: PURE_VVOL_ID2 carries the same
+    # value, so a value-only filter returns duplicate rows.
+    assert "PURE_VVOL_ID'" in flt
+    assert VVOL_ID in flt
+
+
+async def test_find_volume_by_vvol_id_rejects_non_vvol_ids(monkeypatch):
+    """Only 'rfc4122.<uuid>' can match; anything else short-circuits without
+    reaching the array (and never lands in a filter expression)."""
+    fake = _vvol_sdk()
+    c = _client(fake, monkeypatch)
+    for bad in ("naa.624a9370f269", "rfc4122.not-a-uuid", "' or '1'='1",
+                "[vvol-datastore] rfc4122.bf01/disk.vmdk"):
+        assert await c.find_volume_by_vvol_id(bad) is None
+    assert not fake.calls
+
+
+async def test_find_volume_by_vvol_id_unknown_id_is_none(monkeypatch):
+    c = _client(_vvol_sdk(), monkeypatch)
+    assert await c.find_volume_by_vvol_id("rfc4122.00000000-0000-0000-0000-000000000000") is None
+
+
+async def test_find_volume_by_vvol_id_ignores_other_tag_keys(monkeypatch):
+    """Only PURE_VVOL_ID is authoritative; other keys collide across volumes."""
+    fake = _VvolSDK(
+        # VMW_VVolName is not unique - it must never be used to resolve.
+        tags=[_Tag("VMW_VVolName", VVOL_ID, VVOL_VOL)],
+        vols=[_Vol(VVOL_VOL, VVOL_SERIAL)],
+    )
+    c = _client(fake, monkeypatch)
+    assert await c.find_volume_by_vvol_id(VVOL_ID) is None
+
+
+async def test_find_volume_by_vvol_id_skips_destroyed_volume(monkeypatch):
+    """A tag can outlive its volume (destroyed, not yet eradicated)."""
+    fake = _VvolSDK(
+        tags=[_Tag("PURE_VVOL_ID", VVOL_ID, VVOL_VOL)],
+        vols=[_Vol(VVOL_VOL, VVOL_SERIAL, destroyed=True)],
+    )
+    c = _client(fake, monkeypatch)
+    assert await c.find_volume_by_vvol_id(VVOL_ID) is None
+
+
+async def test_find_volume_by_vvol_id_blank_input(monkeypatch):
+    fake = _vvol_sdk()
+    c = _client(fake, monkeypatch)
+    assert await c.find_volume_by_vvol_id("") is None
+    assert await c.find_volume_by_vvol_id(None) is None
+    # Cheap guard: no API traffic for an input that cannot match.
+    assert not fake.calls
+
+
+# --------------------------------------------------------------------------- #
+# Pod/realm-scoped volume-name resolution
+# --------------------------------------------------------------------------- #
+class _ScopedSDK(_FakeSDK):
+    """Volume inventory where names may be pod- or realm-scoped."""
+
+    def __init__(self, vols=None, **kw):
+        super().__init__(**kw)
+        self._vols = vols or []
+
+    def get_volumes(self, names=None, filter=None, **kw):
+        self.calls.append(("get_volumes", tuple(names or []), filter))
+        if names:
+            items = [v for v in self._vols if v.name in names]
+            if not items:
+                return _Resp(status_code=400, errors="Volume does not exist")
+            return _Resp(items=items)
+        if filter:
+            # Mirror the server's "name='*::<leaf>'" wildcard behaviour.
+            m = re.search(r"name='\*::([^']*)'", filter)
+            if m:
+                leaf = m.group(1)
+                return _Resp(items=[v for v in self._vols
+                                    if v.name.split("::")[-1] == leaf
+                                    and "::" in v.name])
+        return _Resp(items=self._vols)
+
+
+LEAF = "nx-1234567890123456789-51-dt"
+SCOPED = f"FSA76::AHV76::{LEAF}"
+
+
+async def test_resolve_volume_name_exact_match_wins(monkeypatch):
+    fake = _ScopedSDK(vols=[_Vol(LEAF, "AAA")])
+    c = _client(fake, monkeypatch)
+    assert await c.resolve_volume_name(LEAF) == LEAF
+    # An exact hit must not trigger a wildcard search.
+    assert all(x[2] is None for x in fake.calls if x[0] == "get_volumes")
+
+
+async def test_resolve_volume_name_finds_pod_scoped(monkeypatch):
+    """Nutanix reports the leaf name while the array holds pod::realm::leaf."""
+    fake = _ScopedSDK(vols=[_Vol(SCOPED, "BBB")])
+    c = _client(fake, monkeypatch)
+    assert await c.resolve_volume_name(LEAF) == SCOPED
+
+
+async def test_resolve_volume_name_ambiguous_raises(monkeypatch):
+    """The same leaf in two pods cannot be chosen between — picking one could
+    attach another tenant's data."""
+    fake = _ScopedSDK(vols=[_Vol(f"podA::{LEAF}", "AAA"),
+                            _Vol(f"podB::{LEAF}", "BBB")])
+    c = _client(fake, monkeypatch)
+    with pytest.raises(FlashArrayApiError) as e:
+        await c.resolve_volume_name(LEAF)
+    assert "ambiguous" in str(e.value).lower()
+
+
+async def test_resolve_volume_name_skips_destroyed(monkeypatch):
+    fake = _ScopedSDK(vols=[_Vol(SCOPED, "BBB", destroyed=True)])
+    c = _client(fake, monkeypatch)
+    assert await c.resolve_volume_name(LEAF) is None
+
+
+async def test_resolve_volume_name_already_qualified_not_found(monkeypatch):
+    """A fully-qualified name that misses should not fall back to a suffix
+    search, which could only match the same volume."""
+    fake = _ScopedSDK(vols=[])
+    c = _client(fake, monkeypatch)
+    assert await c.resolve_volume_name(SCOPED) is None
+    assert not [x for x in fake.calls if x[0] == "get_volumes" and x[2]]
+
+
+async def test_resolve_volume_name_rejects_quote(monkeypatch):
+    """A quote cannot occur in an FA volume name and would break the filter
+    expression, so it is treated as unmatchable rather than escaped."""
+    fake = _ScopedSDK(vols=[_Vol(SCOPED, "BBB")])
+    c = _client(fake, monkeypatch)
+    assert await c.resolve_volume_name("nx-1' or name='*") is None
+
+
+async def test_resolve_volume_name_blank(monkeypatch):
+    fake = _ScopedSDK(vols=[])
+    c = _client(fake, monkeypatch)
+    assert await c.resolve_volume_name("") is None
+    assert await c.resolve_volume_name(None) is None
+    assert not fake.calls

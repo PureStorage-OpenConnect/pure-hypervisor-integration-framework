@@ -39,9 +39,9 @@ async def _wait_job(client, job_id, tries=600):
 
 
 def test_all_real_connectors_present():
-    # The six target hypervisors must all be discovered.
+    # The seven target hypervisors must all be discovered.
     assert set(REAL_CONNECTORS) == {
-        "vsphere", "openshift", "openstack", "proxmox", "xcpng", "hpevme"
+        "vsphere", "openshift", "openstack", "proxmox", "xcpng", "hpevme", "nutanix"
     }
 
 

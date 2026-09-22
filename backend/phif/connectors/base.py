@@ -381,6 +381,20 @@ class HypervisorConnector(ABC):
     SUPPORTED_PROTOCOLS: ClassVar[set[Protocol]] = set()
     # Maturity flag surfaced in the UI: "ga" | "preview" | "scaffold"
     maturity: ClassVar[str] = "ga"
+    # True when the PLATFORM allocates and presents FlashArray volumes itself, so
+    # PHIF neither needs nor manages a host group for it.
+    #
+    # Nutanix AHV with FlashArray external storage is the case this exists for:
+    # Prism creates the backing volume for each vDisk and connects it to its own
+    # stargate hosts. There is no operator-managed host group, and demanding one
+    # failed migration preflight outright.
+    #
+    # This does NOT change the migration pattern — such a connector still creates
+    # the destination VM and its disks and then has the source volume copied on
+    # top of them, exactly like every other destination. It only means the
+    # host-group precondition (and the source-side disconnect-from-group step)
+    # does not apply.
+    MANAGES_VOLUME_PRESENTATION: ClassVar[bool] = False
 
     def __init__(self, ctx: ConnectorContext):
         self.ctx = ctx
@@ -876,6 +890,9 @@ class HypervisorConnector(ABC):
 
         Migration unmaps volumes from the source group and maps them to the
         destination group. Defaults to ``connection['host_group']``.
+
+        Returns ``""`` for a platform that presents volumes itself — see
+        :attr:`MANAGES_VOLUME_PRESENTATION`.
         """
         return self.ctx.target.get("host_group") or ""
 
