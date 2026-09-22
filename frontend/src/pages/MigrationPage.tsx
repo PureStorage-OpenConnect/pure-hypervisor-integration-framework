@@ -370,7 +370,6 @@ export default function MigrationPage() {
                 value={vmRef}
                 onChange={(e) => setVmRef(e.target.value)}
                 disabled={busy}
-                size={Math.min(12, Math.max(2, visibleVms.length + 1))}
               >
                 <option value="">{busy ? "Loading…" : "Select…"}</option>
                 {visibleVms.map((v) => (
