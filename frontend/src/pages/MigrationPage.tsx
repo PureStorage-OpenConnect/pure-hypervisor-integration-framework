@@ -366,10 +366,15 @@ export default function MigrationPage() {
                 disabled={busy || !(vms ?? []).length}
                 style={{ marginBottom: 6 }}
               />
+              {/* A sized list box, not a collapsed dropdown: the native dropdown
+                  popup overlays the page, so the filter box above cannot be typed
+                  into while it is open. This keeps both usable at once. It is
+                  single-select — no `multiple` attribute. */}
               <select
                 value={vmRef}
                 onChange={(e) => setVmRef(e.target.value)}
                 disabled={busy}
+                size={Math.min(12, Math.max(2, visibleVms.length + 1))}
               >
                 <option value="">{busy ? "Loading…" : "Select…"}</option>
                 {visibleVms.map((v) => (
